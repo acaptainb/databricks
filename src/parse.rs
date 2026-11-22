@@ -20,7 +20,27 @@ pub fn map_file(p: &Path) -> S {
         let _ = m.advise(memmap2::Advice::WillNeed);
     }
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
+    if let Ok(mut v) = MAPS.lock() {
+        v.push(m);
+    }
     &m[..]
+}
+
+/// Every input mapping, so they can be released in parallel before exit.
+static MAPS: std::sync::Mutex<Vec<&'static memmap2::Mmap>> = std::sync::Mutex::new(Vec::new());
+
+/// Drop the page-table entries of all input mappings, in parallel. The kernel
+/// would otherwise tear down ~2 GB of file mappings on one thread at exit,
+/// and the container's clock runs until exit completes.
+pub fn release_inputs() {
+    let maps: Vec<&'static memmap2::Mmap> = MAPS.lock().map(|v| v.clone()).unwrap_or_default();
+    maps.par_iter().for_each(|m| {
+        #[cfg(unix)]
+        // SAFETY: called after the last read of any input byte
+        unsafe {
+            let _ = m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
+        }
+    });
 }
 
 pub fn list_csv(dir: &Path) -> Vec<S> {

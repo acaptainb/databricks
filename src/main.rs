@@ -158,11 +158,12 @@ pub struct IdPart {
     raw: Vec<NRef>, // the key's bytes in the links file
     hashes: Vec<u64>,
     name: Vec<NRef>,
+    nh: Vec<u64>, // hash of the name
 }
 
 impl IdPart {
     fn new() -> Self {
-        IdPart { table: HashTable::new(), keys: Vec::new(), raw: Vec::new(), hashes: Vec::new(), name: Vec::new() }
+        IdPart { table: HashTable::new(), keys: Vec::new(), raw: Vec::new(), hashes: Vec::new(), name: Vec::new(), nh: Vec::new() }
     }
     #[inline(always)]
     fn intern(&mut self, k: Small, h: u64, raw: NRef) -> u32 {
@@ -315,15 +316,18 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         }
     });
     let allr: Vec<NRef> = parts.iter().flat_map(|p| p.raw.iter().copied()).collect();
+    let allh: Vec<u64> = parts.iter().flat_map(|p| p.hashes.iter().copied()).collect();
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
         part.name = (0..m).map(|i| allr[best[root[b + i] as usize].load(AO::Relaxed) as usize]).collect();
+        part.nh = (0..m).map(|i| allh[best[root[b + i] as usize].load(AO::Relaxed) as usize]).collect();
     });
     drop(root);
     drop(best);
     drop(all);
     drop(allr);
+    drop(allh);
     vlog("links: names done");
     let t = LinkTable::build(&parts, n);
     vlog("links: table built");
@@ -367,8 +371,8 @@ impl LinkTable {
                 while !st[idx].key.is_empty() {
                     idx = (idx + 1) & sub_mask;
                 }
-                let name = part.name[i];
-                st[idx] = LSlot { key: part.keys[i], name, nh: Small::new(name.as_bytes()).h() };
+                let (name, nh) = (part.name[i], part.nh[i]);
+                st[idx] = LSlot { key: part.keys[i], name, nh };
             }
         });
         LinkTable { slots, sub_bits: sub.trailing_zeros(), sub_mask }
@@ -1383,5 +1387,6 @@ fn main() {
         accs.iter().map(|a| a.rows.len()).sum::<usize>(),
         camp_rows.len()
     ));
+    release_inputs();
     std::process::exit(0);
 }

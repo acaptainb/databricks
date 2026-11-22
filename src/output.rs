@@ -35,8 +35,9 @@ fn props() -> Arc<WriterProperties> {
     )
 }
 
-fn ba(b: &[u8]) -> ByteArray {
-    ByteArray::from(b.to_vec())
+/// Zero-copy: every string written is a static slice of a mapped input file.
+fn ba(b: &'static [u8]) -> ByteArray {
+    ByteArray::from(bytes::Bytes::from_static(b))
 }
 
 pub fn write_user(path: &Path, rows: &[UserRow], cats: &[S]) {
