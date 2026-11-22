@@ -382,13 +382,23 @@ fn finish_line<const N: usize>(data: S, start: usize, end: usize, commas: &[u32;
         s = e + 1;
     }
     if quotes != 0 {
+        // Branch-free: strip one quote pair from each field that starts and
+        // ends with a quote (and has at least 2 bytes); count what was stripped.
         let mut k2 = 0u32;
+        let base = data.as_ptr() as usize;
         for f in out.iter_mut() {
             let n = f.len();
-            if n >= 2 && f[0] == b'"' && f[n - 1] == b'"' {
-                *f = &f[1..n - 1];
-                k2 += 2;
-            }
+            let p = f.as_ptr();
+            let last = n.saturating_sub(1);
+            // SAFETY: when n == 0 both reads hit p[0], which is the separator
+            // after this field, or the byte before the end of data; reads are
+            // clamped to the data range below.
+            let lim = base + data.len() - 1;
+            let a = unsafe { *((p as usize).min(lim) as *const u8) } == b'"';
+            let b = unsafe { *((p as usize + last).min(lim) as *const u8) } == b'"';
+            let q = ((n >= 2) & a & b) as usize;
+            *f = unsafe { std::slice::from_raw_parts(p.add(q), n - 2 * q) };
+            k2 += 2 * q as u32;
         }
         if k2 != quotes {
             return None;
