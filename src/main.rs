@@ -934,12 +934,13 @@ struct Ctx {
     ndays: usize,
     ws_day: i64,
     ncat: usize,
+    rows_cap: usize, // expected user_daily rows per worker
 }
 
 impl Acc {
     fn new(cx: &Ctx) -> Acc {
         Acc {
-            rows: Vec::new(),
+            rows: Vec::with_capacity(cx.rows_cap),
             camp: vec![0; (cx.ncamp + 1) * cx.ndays * 4],
             counts: vec![0; cx.ncamp],
             pos: vec![0; cx.ncamp],
@@ -1005,6 +1006,15 @@ const NRB: usize = 1 << RB;
 #[inline(always)]
 fn rbucket(k: u64) -> usize {
     (k >> (64 - RB)) as usize
+}
+
+/// Clicks are about a quarter as many as events: fewer radix buckets.
+const RBC: u32 = 10;
+const NRBC: usize = 1 << RBC;
+
+#[inline(always)]
+fn rbucket_c(k: u64) -> usize {
+    (k >> (64 - RBC)) as usize
 }
 
 /// Insertion sort for the short runs, `big` (a library sort) for longer ones.
@@ -1125,10 +1135,10 @@ fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
 /// Concatenate the per-job clicks, sorted by key and then click_id descending
 /// (so the last click at or before a session start is the winner).
 fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
-    let mut cnt = vec![0u32; NRB];
+    let mut cnt = vec![0u32; NRBC];
     for p in &parts {
         for c in p {
-            cnt[rbucket(c.k)] += 1;
+            cnt[rbucket_c(c.k)] += 1;
         }
     }
     let n = starts_from_counts(&mut cnt);
@@ -1137,7 +1147,7 @@ fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
     let dst = out.as_mut_ptr();
     for p in &parts {
         for &c in p {
-            let b = rbucket(c.k);
+            let b = rbucket_c(c.k);
             // SAFETY: as in sorted_events
             unsafe { dst.add(cnt[b] as usize).write(c) };
             cnt[b] += 1;
@@ -1145,8 +1155,8 @@ fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
     }
     drop(parts);
     unsafe { out.set_len(n) };
-    for b in 0..NRB {
-        let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
+    for b in 0..NRBC {
+        let e = if b + 1 < NRBC { starts[b + 1] as usize } else { n };
         small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k || (x.k == y.k && x.cid.as_bytes() > y.cid.as_bytes()), |s| {
             s.sort_unstable_by(|x, y| x.k.cmp(&y.k).then_with(|| y.cid.as_bytes().cmp(x.cid.as_bytes())))
         });
@@ -1454,7 +1464,9 @@ fn main() {
     // Phase 4: sessions.
     let ws_day = w.ws.div_euclid(DAY);
     let ndays = ((w.we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
-    let cx = Ctx { base, ncamp: camps.channel.len(), ndays, ws_day, ncat: prods.cats.len() };
+    // about one user_daily row per 9 events (20M events: 2.25M rows)
+    let rows_cap = est_events / 8 / nthreads + 1024;
+    let cx = Ctx { base, ncamp: camps.channel.len(), ndays, ws_day, ncat: prods.cats.len(), rows_cap };
     let ev_by_pp = transpose(sv_jobs, PP);
     let ck_by_pp = transpose(ck_jobs, PP);
     let tpos = &tpos;
