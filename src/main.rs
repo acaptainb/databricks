@@ -222,6 +222,7 @@ unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
 fn build_links(files: &[S]) -> (LinkTable, usize) {
+    vlog("links: start");
     let chunks = make_chunks_sized::<2>(files, &["user_id_a", "user_id_b"], 1 << 19);
     // parse, and scatter each side by hash partition: (id, hash, slot = pair*2+side)
     let parsed: Vec<(usize, Vec<Vec<(Small, u64, u32, NRef)>>)> = chunks
@@ -244,6 +245,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             (n as usize, v)
         })
         .collect();
+    vlog(&format!("links: parsed {} chunks", parsed.len()));
     let mut chunk_base = Vec::with_capacity(parsed.len());
     let mut npairs = 0usize;
     for (n, _) in &parsed {
@@ -269,7 +271,9 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             part
         })
         .collect();
+    vlog("links: interned");
     drop(parsed);
+    vlog("links: parsed buffers freed");
     let mut pbase = vec![0u32; PP + 1];
     for p in 0..PP {
         pbase[p + 1] = pbase[p] + parts[p].keys.len() as u32;
