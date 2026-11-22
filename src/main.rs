@@ -42,6 +42,7 @@ pub const CHUNK: usize = 4 << 20;
 
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SES_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Timestamped stage note on stderr when SS_VERBOSE is set.
 fn vlog(m: &str) {
@@ -1476,16 +1477,29 @@ fn main() {
         |((ev, ck), _): &((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len()).sum::<usize>(),
         || Acc::new(&cx),
         |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| {
+            let t0 = Instant::now();
             for k in kills {
                 let (t, _, idx) = lay.unpack(k);
                 ev_parts[tpos[t]][idx / 8].0[idx % 8].pc = PC_DEAD;
             }
+            let t1 = Instant::now();
             let mut evs: Vec<Sv> = sorted_events(ev_parts);
+            let t2 = Instant::now();
             let mut cks: Vec<Ck> = sorted_clicks(ck_parts);
+            let t3 = Instant::now();
             process_partition(acc, &cx, &mut evs, &mut cks);
+            let t4 = Instant::now();
+            let ns = |a: Instant, b: Instant| (b - a).as_nanos() as u64;
+            SES_NS[0].fetch_add(ns(t0, t1), std::sync::atomic::Ordering::Relaxed);
+            SES_NS[1].fetch_add(ns(t1, t2), std::sync::atomic::Ordering::Relaxed);
+            SES_NS[2].fetch_add(ns(t2, t3), std::sync::atomic::Ordering::Relaxed);
+            SES_NS[3].fetch_add(ns(t3, t4), std::sync::atomic::Ordering::Relaxed);
+            drop(evs);
+            SES_NS[4].fetch_add(ns(t4, Instant::now()), std::sync::atomic::Ordering::Relaxed);
         },
     );
     log("sessions");
+    vlog(&format!("sessions cpu ms: kills {} sort-events {} sort-clicks {} attribute {} free {}", SES_NS[0].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[1].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[2].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[3].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[4].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000));
 
     // Phase 4: output.
     let mut camp = vec![0u64; (cx.ncamp + 1) * ndays * 4];
