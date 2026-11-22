@@ -832,7 +832,7 @@ fn parse_event_chunk_impl<const IDENT: bool>(acc: &mut EvAcc, c: &Chunk, w: &Win
 /// Dedup one event_id bucket over its keys: per event keep the copy with the
 /// smallest ingest_ts (the first seen on a tie: equal ingest means identical
 /// copies). Returns the locations of the session records of losing copies.
-fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u32> {
+fn dedup_keys(blocks: Vec<Vec<DBlock>>, lay: LocLayout) -> Vec<u32> {
     let total: usize = blocks.iter().map(|v| v.len() * 4).sum();
     let mut table: HashTable<DKey> = HashTable::with_capacity(total);
     let mut kills = Vec::new();
@@ -861,6 +861,8 @@ fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u32> {
             }
         }
     }
+    // grouped by person partition, so each partition finds its kills by binary search
+    kills.sort_unstable_by_key(|&k| lay.unpack(k).1);
     kills
 }
 
@@ -1451,15 +1453,8 @@ fn main() {
         dk_jobs.push(a.dk);
     }
     let dk_buckets = transpose(dk_jobs, DB);
-    let kills: Vec<Vec<u32>> = dk_buckets.into_par_iter().map(dedup_keys).collect();
-    let mut kills_pp: Vec<Vec<u32>> = (0..PP).map(|_| Vec::new()).collect();
-    for kv in &kills {
-        for &k in kv {
-            kills_pp[lay.unpack(k).1].push(k);
-        }
-    }
-    drop(kills);
-    log(&format!("dedup: {} copies dropped", kills_pp.iter().map(|v| v.len()).sum::<usize>()));
+    let kills: Vec<Vec<u32>> = dk_buckets.into_par_iter().map(|b| dedup_keys(b, lay)).collect();
+    log(&format!("dedup: {} copies dropped", kills.iter().map(|v| v.len()).sum::<usize>()));
 
     // Phase 4: sessions.
     let ws_day = w.ws.div_euclid(DAY);
@@ -1470,15 +1465,20 @@ fn main() {
     let ev_by_pp = transpose(sv_jobs, PP);
     let ck_by_pp = transpose(ck_jobs, PP);
     let tpos = &tpos;
+    let kills = &kills;
     let accs: Vec<Acc> = per_thread_owned(
-        ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
+        ev_by_pp.into_iter().zip(ck_by_pp).enumerate().collect(),
         nthreads,
-        |((ev, ck), _): &((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len()).sum::<usize>(),
+        |(_, (ev, ck)): &(usize, (Vec<Vec<SvBlock>>, Vec<Vec<Ck>>))| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len()).sum::<usize>(),
         || Acc::new(&cx),
-        |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| {
-            for k in kills {
-                let (t, _, idx) = lay.unpack(k);
-                ev_parts[tpos[t]][idx / 8].0[idx % 8].pc = PC_DEAD;
+        |acc, (p, (mut ev_parts, ck_parts)): (usize, (Vec<Vec<SvBlock>>, Vec<Vec<Ck>>))| {
+            // this partition's kills: one sorted run in each dedup bucket's list
+            for kv in kills.iter() {
+                let lo = kv.partition_point(|&k| lay.unpack(k).1 < p);
+                for &k in kv[lo..].iter().take_while(|&&k| lay.unpack(k).1 == p) {
+                    let (t, _, idx) = lay.unpack(k);
+                    ev_parts[tpos[t]][idx / 8].0[idx % 8].pc = PC_DEAD;
+                }
             }
             let mut evs: Vec<Sv> = sorted_events(ev_parts);
             let mut cks: Vec<Ck> = sorted_clicks(ck_parts);
