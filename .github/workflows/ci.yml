@@ -36,17 +36,49 @@ jobs:
       - name: Run the 36 fixtures
         run: python3 scripts/run_fixtures.py fixtures -- ./target/x86_64-unknown-linux-gnu/release/shopping-sessions
 
-  docker:
+  # Same path as the scorer: build the Docker image, run it with scorer flags
+  # on the 1M dev set (seed 1) and diff against the published dev answer.
+  docker-dev:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ci-assets
+          path: assets
+
+      - name: Cache generator
+        id: gen
+        uses: actions/cache@v4
+        with:
+          path: assets/generator/target/release/generate
+          key: generator-${{ hashFiles('assets/generator/src/**', 'assets/generator/Cargo.lock') }}
+
+      - name: Build generator
+        if: steps.gen.outputs.cache-hit != 'true'
+        run: cargo build --release --manifest-path assets/generator/Cargo.toml
+
       - name: Build image
         run: docker build -t shopping-sessions:latest .
-      - name: Run image on one fixture
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install polars
+        run: pip install polars
+
+      - name: Fixtures through Docker
+        run: python3 scripts/run_fixtures.py fixtures -- env CPUS=4 MEM=14g PLATFORM=linux/amd64 scripts/docker_run.sh
+
+      - name: Generate dev set
+        run: assets/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+
+      - name: Run on dev set
         run: |
-          mkdir -p out && chmod 777 out
-          docker run --rm --network none --read-only --user 1000:1000 \
-            -v "$PWD/fixtures/A1/input":/data:ro -v "$PWD/out":/output \
-            -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
-            shopping-sessions:latest
-          find out -type f
+          rm -rf out
+          time CPUS=4 MEM=14g scripts/docker_run.sh dev out
+
+      - name: Check against dev answer
+        run: python3 scripts/compare.py out assets/dev-answer
