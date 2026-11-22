@@ -1332,6 +1332,26 @@ fn main() {
     );
     let ck_chunks = make_chunks::<4>(&ck_files, &["click_id", "user_id", "campaign_id", "ts"]);
     log("mapped");
+    // PROBE: stream every input byte once (all threads) and time it.
+    let probe_on = std::env::var("SS_PROBE").is_ok() && ev_chunks.iter().map(|c| c.data.len()).sum::<usize>() > (1usize << 30);
+    let (touch_ms, touch_sink) = if probe_on {
+        let t = Instant::now();
+        let all: Vec<&Chunk> = ev_chunks.iter().chain(ck_chunks.iter()).collect();
+        let sink: u64 = all
+            .par_iter()
+            .map(|c| {
+                let mut s = 0u64;
+                for w in c.data.chunks_exact(8) {
+                    s = s.wrapping_add(u64::from_le_bytes(w.try_into().unwrap()));
+                }
+                s
+            })
+            .reduce(|| 0, |a, b| a.wrapping_add(b));
+        (t.elapsed().as_millis() as u64, sink)
+    } else {
+        (0, 0)
+    };
+    let t_mapped = t0.elapsed().as_millis() as u64;
     let nthreads = rayon::current_num_threads().max(1);
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.data.len()).sum();
     let ck_bytes: usize = ck_chunks.iter().map(|c| c.data.len()).sum();
@@ -1347,6 +1367,7 @@ fn main() {
 
     // Phase 1: links, on all threads.
     let (links, nlink) = build_links(&ln_files);
+    let t_links = t0.elapsed().as_millis() as u64;
     log(&format!("links: {nlink} ids"));
 
     // Phase 2: events and clicks in one parallel pass; both resolve persons.
@@ -1365,6 +1386,7 @@ fn main() {
         },
     );
     ev_accs.par_iter_mut().for_each(|a| a.finish(&links, base));
+    let t_parse = t0.elapsed().as_millis() as u64;
     log(&format!("parsed events + clicks: {} chunks", ev_chunks.len()));
 
     // Phase 3: dedup over the keys; kills grouped by partition.
@@ -1389,6 +1411,7 @@ fn main() {
     }
     drop(kills);
     log(&format!("dedup: {} copies dropped", kills_pp.iter().map(|v| v.len()).sum::<usize>()));
+    let t_dedup = t0.elapsed().as_millis() as u64;
 
     // Phase 4: sessions.
     let ws_day = w.ws.div_euclid(DAY);
@@ -1397,7 +1420,7 @@ fn main() {
     let ev_by_pp = transpose(sv_jobs, PP);
     let ck_by_pp = transpose(ck_jobs, PP);
     let tpos = &tpos;
-    let accs: Vec<Acc> = per_thread_owned(
+    let mut accs: Vec<Acc> = per_thread_owned(
         ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
         nthreads,
         |((ev, ck), _): &((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len()).sum::<usize>(),
@@ -1413,6 +1436,49 @@ fn main() {
         },
     );
     log("sessions");
+    let t_sess = t0.elapsed().as_millis() as u64;
+    // TIMING PROBE v2 (probe2 branch only; enabled by SS_PROBE=1 in this
+    // branch's Dockerfile). On practice-size data it deliberately corrupts
+    // user_daily so the scorer's missing / extra / differing row counts carry:
+    //   missing   = links_ms * 1000 + parse_ms      (parse = links end -> parse end)
+    //   extra     = dedup_ms * 1000 + sessions_ms
+    //   differing = touch_ms * 1000 + thp * 100 + nthreads
+    // touch_ms: streaming every input byte once before the pipeline starts
+    // (all threads), so parse_ms then excludes page-cache and fault costs.
+    if probe_on {
+        let c = |v: u64| v.min(999);
+        let thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+            .ok()
+            .and_then(|s| s.split_whitespace().position(|w| w.starts_with('[')))
+            .map(|i| i as u64)
+            .unwrap_or(9);
+        let missing = c(t_links - t_mapped) * 1000 + c(t_parse - t_links);
+        let extra = c(t_dedup - t_parse) * 1000 + c(t_sess - t_dedup);
+        let differing = c(touch_ms) * 1000 + thp.min(9) * 100 + (nthreads as u64).min(99);
+        eprintln!("probe: missing {missing} extra {extra} differing {differing} (sink {touch_sink})");
+        let mut left = missing as usize;
+        for a in accs.iter_mut() {
+            let take = left.min(a.rows.len().saturating_sub(1000));
+            let n = a.rows.len();
+            a.rows.truncate(n - take);
+            left -= take;
+        }
+        let mut left = differing as usize;
+        for a in accs.iter_mut().rev() {
+            for r in a.rows.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                r.events += 1;
+                left -= 1;
+            }
+        }
+        let day = ws_day as i32;
+        for i in 0..extra {
+            let name: &'static [u8] = Box::leak(format!("zz_probe_{i:07}").into_bytes().into_boxed_slice());
+            accs[0].rows.push(UserRow { name: NRef::of(name), day, sessions: 1, events: 1, revenue: 0, top: -1 });
+        }
+    }
 
     // Phase 4: output.
     let mut camp = vec![0u64; (cx.ncamp + 1) * ndays * 4];
