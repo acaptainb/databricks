@@ -1,0 +1,93 @@
+name: Bench
+
+# Times the pipeline at practice size and checks that its output is identical
+# to a reference commit (the last scored one). Run with:
+#   gh workflow run bench.yml -f ref=<branch> [-f base=<sha>] [-f events=20000000]
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or commit to benchmark
+        default: main
+      base:
+        description: Reference commit whose output must match
+        default: 54a04f8
+      events:
+        description: Events to generate (clicks = events / 4)
+        default: "20000000"
+      seed:
+        description: Generator seed
+        default: "7"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          path: cur
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ci-assets
+          path: assets
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-reg-${{ hashFiles('cur/Cargo.lock') }}
+
+      - name: Cache generator
+        id: gen
+        uses: actions/cache@v4
+        with:
+          path: assets/generator/target/x86_64-unknown-linux-gnu/release/generate
+          key: generator-${{ hashFiles('assets/generator/src/**', 'assets/generator/Cargo.lock') }}
+
+      - name: Build generator
+        if: steps.gen.outputs.cache-hit != 'true'
+        run: cd cur && cargo build --release --manifest-path ../assets/generator/Cargo.toml
+
+      - name: Build candidate and reference
+        run: |
+          git -C cur worktree add ../base ${{ inputs.base }}
+          (cd cur && cargo build --release --locked) &
+          (cd base && cargo build --release --locked) &
+          wait
+          cp cur/target/x86_64-unknown-linux-gnu/release/shopping-sessions cand
+          cp base/target/x86_64-unknown-linux-gnu/release/shopping-sessions ref
+
+      - name: Generate data
+        run: |
+          E=${{ inputs.events }}
+          time assets/generator/target/x86_64-unknown-linux-gnu/release/generate \
+            --seed ${{ inputs.seed }} --events $E --clicks $((E / 4)) --output data
+          du -sh data data/*
+          nproc; free -g; lscpu | grep -E 'Model name|Flags' | cut -c1-200
+
+      - name: Time reference and candidate
+        run: |
+          run() { rm -rf "$2"; mkdir -p "$2"; DATA_DIR=data OUTPUT_DIR="$2" NCPU=$(nproc) SS_VERBOSE=1 \
+                  /usr/bin/time -f "  wall %e s  user %U  sys %S  maxrss %M KB" ./"$1"; }
+          cat data/events/*.csv data/clicks/*.csv data/links/*.csv > /dev/null
+          for i in 1 2 3; do
+            echo "=== ref run $i";  run ref  out-ref
+            echo "=== cand run $i"; run cand out-cand
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Candidate output identical to reference
+        run: |
+          pip install -q polars
+          python3 cur/scripts/compare.py out-cand out-ref
+
+      - name: Candidate fixtures
+        run: python3 cur/scripts/run_fixtures.py cur/fixtures -- ./cand
