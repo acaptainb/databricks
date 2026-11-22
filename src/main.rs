@@ -642,6 +642,7 @@ struct EvAcc {
     lay: LocLayout,
     sv: Vec<Vec<SvBlock>>, // [partition]
     sv_cnt: Vec<u32>,
+    hist: Vec<u32>, // [partition * NCB + coarse bucket] records written
     sc: SvStage,
     dk: Vec<Vec<DBlock>>, // [dedup bucket]
     st: Vec<DBlock>,
@@ -656,6 +657,7 @@ impl EvAcc {
             lay,
             sv: (0..PP).map(|_| Vec::with_capacity(sv_cap)).collect(),
             sv_cnt: vec![0; PP],
+            hist: vec![0; PP * NCB],
             sc: SvStage::new(PP),
             dk: (0..DB).map(|_| Vec::with_capacity(dk_cap)).collect(),
             st: vec![DBlock([DKEY_PAD; 4]); DB],
@@ -699,7 +701,9 @@ impl EvAcc {
             let idx = self.sv_cnt[part];
             assert!(idx < (1u32 << self.lay.ibits), "record index overflows its location field");
             self.sv_cnt[part] = idx + 1;
-            self.sc.push(&mut self.sv, part, Sv { k: key(ph, p.ts - base), name, phi: (ph >> 32) as u32, pc: p.pc });
+            let k = key(ph, p.ts - base);
+            self.hist[part * NCB + cbucket(k)] += 1;
+            self.sc.push(&mut self.sv, part, Sv { k, name, phi: (ph >> 32) as u32, pc: p.pc });
             let loc = self.lay.pack(self.t, part, idx);
             self.push_key(p.bucket as usize, DKey { hx: p.hx, ingest: p.ingest, loc });
         }
@@ -976,44 +980,87 @@ fn starts_from_counts(cnt: &mut [u32]) -> usize {
     s as usize
 }
 
-/// Concatenate the per-job event pairs, sorted by key.
-fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
-    // records marked PC_DEAD (killed by dedup) or PC_PAD (padding) are skipped
-    let mut cnt = vec![0u32; NRB];
-    for p in &parts {
-        for pr in p {
-            for e in &pr.0 {
-                if e.pc < PC_DEAD {
-                    cnt[rbucket(e.k)] += 1;
-                }
-            }
-        }
+/// Coarse buckets of a partition's session records: the top CB_BITS of the key.
+/// The parse pass counts records per (partition, coarse bucket), so the session
+/// pass scatters a partition in one read instead of a counting read plus a
+/// scattering read.
+const CB_BITS: u32 = 6;
+const NCB: usize = 1 << CB_BITS;
+
+#[inline(always)]
+fn cbucket(k: u64) -> usize {
+    (k >> (64 - CB_BITS)) as usize
+}
+
+/// Sort one coarse bucket by key: a counting scatter on the next RB - CB_BITS
+/// key bits (in cache), then a small sort of each fine bucket.
+fn sort_coarse(s: &mut [Sv], tmp: &mut Vec<Sv>) {
+    let n = s.len();
+    if n <= 48 {
+        small_sort(s, |x, y| x.k < y.k, |v| v.sort_unstable_by_key(|x| x.k));
+        return;
     }
-    let n = starts_from_counts(&mut cnt);
-    let starts = cnt.clone();
+    const FB: u32 = RB - CB_BITS;
+    const NFB: usize = 1 << FB;
+    let fb = |k: u64| ((k >> (64 - RB)) as usize) & (NFB - 1);
+    let mut cnt = [0u32; NFB + 1];
+    for e in s.iter() {
+        cnt[fb(e.k) + 1] += 1;
+    }
+    for i in 0..NFB {
+        cnt[i + 1] += cnt[i];
+    }
+    let starts = cnt;
+    tmp.clear();
+    tmp.reserve(n);
+    let dst = tmp.as_mut_ptr();
+    for &e in s.iter() {
+        let b = fb(e.k);
+        // SAFETY: the counts sized every fine bucket; each slot is written once
+        unsafe { dst.add(cnt[b] as usize).write(e) };
+        cnt[b] += 1;
+    }
+    unsafe { tmp.set_len(n) };
+    s.copy_from_slice(tmp);
+    for b in 0..NFB {
+        small_sort(&mut s[starts[b] as usize..starts[b + 1] as usize], |x, y| x.k < y.k, |v| v.sort_unstable_by_key(|x| x.k));
+    }
+}
+
+/// Concatenate the per-thread session records of one partition, sorted by key.
+/// `counts` are the live records per coarse bucket (killed ones already
+/// subtracted); records marked PC_DEAD or PC_PAD are skipped.
+fn sorted_events(parts: Vec<Vec<SvBlock>>, counts: &[u32]) -> Vec<Sv> {
+    let mut starts = [0u32; NCB + 1];
+    for i in 0..NCB {
+        starts[i + 1] = starts[i] + counts[i];
+    }
+    let n = starts[NCB] as usize;
+    let mut pos = starts;
     let mut out: Vec<Sv> = Vec::with_capacity(n);
     let dst = out.as_mut_ptr();
     for p in &parts {
-        for pr in p {
-            for &e in &pr.0 {
+        for blk in p {
+            for &e in &blk.0 {
                 if e.pc < PC_DEAD {
-                    let b = rbucket(e.k);
-                    // SAFETY: the counting pass sized every bucket; each slot is written once
-                    unsafe { dst.add(cnt[b] as usize).write(e) };
-                    cnt[b] += 1;
+                    let b = cbucket(e.k);
+                    assert!(pos[b] < starts[b + 1], "coarse bucket overflow");
+                    // SAFETY: counts sized every coarse bucket; each slot is written once
+                    unsafe { dst.add(pos[b] as usize).write(e) };
+                    pos[b] += 1;
                 }
             }
         }
     }
     drop(parts);
+    assert!(pos[..NCB] == starts[1..], "coarse bucket counts out of step with records");
     unsafe { out.set_len(n) };
-    for b in 0..NRB {
-        let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
-        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, |s| s.sort_unstable_by_key(|x| x.k));
+    let mut tmp: Vec<Sv> = Vec::new();
+    for b in 0..NCB {
+        sort_coarse(&mut out[starts[b] as usize..starts[b + 1] as usize], &mut tmp);
     }
     out
 }
-
 /// Concatenate the per-job clicks, sorted by key and then click_id descending
 /// (so the last click at or before a session start is the winner).
 fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
@@ -1305,10 +1352,26 @@ fn main() {
     }
     let mut sv_jobs: Vec<Vec<Vec<SvBlock>>> = Vec::with_capacity(ev_accs.len());
     let mut dk_jobs: Vec<Vec<Vec<DBlock>>> = Vec::with_capacity(ev_accs.len());
+    let mut hists: Vec<Vec<u32>> = Vec::with_capacity(ev_accs.len());
     for a in ev_accs {
         sv_jobs.push(a.sv);
         dk_jobs.push(a.dk);
+        hists.push(a.hist);
     }
+    // live-record counts per (partition, coarse bucket), summed over threads
+    let counts_pp: Vec<Vec<u32>> = (0..PP)
+        .into_par_iter()
+        .map(|p| {
+            let mut c = vec![0u32; NCB];
+            for h in &hists {
+                for (x, y) in c.iter_mut().zip(&h[p * NCB..(p + 1) * NCB]) {
+                    *x += *y;
+                }
+            }
+            c
+        })
+        .collect();
+    drop(hists);
     let dk_buckets = transpose(dk_jobs, DB);
     let kills: Vec<Vec<u32>> = dk_buckets.into_par_iter().map(dedup_keys).collect();
     let mut kills_pp: Vec<Vec<u32>> = (0..PP).map(|_| Vec::new()).collect();
@@ -1328,15 +1391,17 @@ fn main() {
     let ck_by_pp = transpose(ck_jobs, PP);
     let tpos = &tpos;
     let accs: Vec<Acc> = per_thread_owned(
-        ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
+        ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp.into_iter().zip(counts_pp)).collect(),
         nthreads,
         || Acc::new(&cx),
-        |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| {
+        |acc, ((mut ev_parts, ck_parts), (kills, mut counts)): ((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), (Vec<u32>, Vec<u32>))| {
             for k in kills {
                 let (t, _, idx) = lay.unpack(k);
-                ev_parts[tpos[t]][idx / 8].0[idx % 8].pc = PC_DEAD;
+                let e = &mut ev_parts[tpos[t]][idx / 8].0[idx % 8];
+                counts[cbucket(e.k)] -= 1;
+                e.pc = PC_DEAD;
             }
-            let mut evs: Vec<Sv> = sorted_events(ev_parts);
+            let mut evs: Vec<Sv> = sorted_events(ev_parts, &counts);
             let mut cks: Vec<Ck> = sorted_clicks(ck_parts);
             process_partition(acc, &cx, &mut evs, &mut cks);
         },
