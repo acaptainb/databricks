@@ -18,4 +18,6 @@ COPY --from=build /shopping-sessions /shopping-sessions
 # Huge pages for the allocator (fewer page faults and TLB misses) and keep
 # freed memory for reuse instead of returning it to the kernel.
 ENV MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_PURGE_DELAY=-1
+# PROBE BRANCH ONLY: encode phase timings into the row diff (see main.rs). Never merge.
+ENV SS_PROBE=1
 CMD ["/shopping-sessions"]

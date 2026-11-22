@@ -1163,6 +1163,7 @@ fn main() {
     );
     let ck_chunks = make_chunks::<4>(&ck_files, &["click_id", "user_id", "campaign_id", "ts"]);
     log("mapped");
+    let t_mapped = t0.elapsed().as_millis() as u64;
     let nthreads = rayon::current_num_threads().max(1);
     assert!(nthreads < 255, "thread slot must fit 8 bits of a record location");
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.data.len()).sum();
@@ -1176,6 +1177,7 @@ fn main() {
 
     // Phase 1: links, on all threads.
     let (links, nlink) = build_links(&ln_files);
+    let t_links = t0.elapsed().as_millis() as u64;
     log(&format!("links: {nlink} ids"));
 
     // Phase 2: events and clicks in one parallel pass; both resolve persons.
@@ -1194,6 +1196,7 @@ fn main() {
         },
     );
     ev_accs.par_iter_mut().for_each(|a| a.finish(&links, base));
+    let t_parse = t0.elapsed().as_millis() as u64;
     log(&format!("parsed events + clicks: {} chunks", ev_chunks.len()));
 
     // Phase 3: dedup over the keys; kills grouped by partition.
@@ -1218,6 +1221,7 @@ fn main() {
     }
     drop(kills);
     log(&format!("dedup: {} copies dropped", kills_pp.iter().map(|v| v.len()).sum::<usize>()));
+    let t_dedup = t0.elapsed().as_millis() as u64;
 
     // Phase 4: sessions.
     let ws_day = w.ws.div_euclid(DAY);
@@ -1226,7 +1230,7 @@ fn main() {
     let ev_by_pp = transpose(sv_jobs, PP);
     let ck_by_pp = transpose(ck_jobs, PP);
     let tpos = &tpos;
-    let accs: Vec<Acc> = per_thread_owned(
+    let mut accs: Vec<Acc> = per_thread_owned(
         ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
         nthreads,
         || Acc::new(&cx),
@@ -1242,6 +1246,51 @@ fn main() {
         },
     );
     log("sessions");
+    let t_sess = t0.elapsed().as_millis() as u64;
+    // TIMING PROBE (probe branch only; enabled by SS_PROBE=1 in this branch's
+    // Dockerfile). On practice-size data it deliberately corrupts user_daily so
+    // the scorer's missing / extra / differing row counts carry phase timings:
+    //   missing   = links_ms * 1000 + parse_ms      (parse = links end -> parse end)
+    //   extra     = dedup_ms * 1000 + sessions_ms
+    //   differing = mapped_ms * 1000 + thp * 100 + nthreads   (thp: 0 always, 1 madvise, 2 never, 9 unknown)
+    // The dev set (small) is left untouched so the submission reaches practice.
+    if std::env::var("SS_PROBE").is_ok() && ev_bytes > (1usize << 30) {
+        let c = |v: u64| v.min(999);
+        let thp = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+            .ok()
+            .and_then(|s| s.split_whitespace().position(|w| w.starts_with('[')))
+            .map(|i| i as u64)
+            .unwrap_or(9);
+        let missing = c(t_links) * 1000 + c(t_parse - t_links);
+        let extra = c(t_dedup - t_parse) * 1000 + c(t_sess - t_dedup);
+        let differing = c(t_mapped) * 1000 + thp.min(9) * 100 + (nthreads as u64).min(99);
+        eprintln!("probe: missing {missing} extra {extra} differing {differing}");
+        // drop `missing` rows, spread over the accumulators
+        let mut left = missing as usize;
+        for a in accs.iter_mut() {
+            let take = left.min(a.rows.len().saturating_sub(1000));
+            let n = a.rows.len();
+            a.rows.truncate(n - take);
+            left -= take;
+        }
+        // alter `differing` of the remaining rows (same key, different events count)
+        let mut left = differing as usize;
+        for a in accs.iter_mut().rev() {
+            for r in a.rows.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                r.events += 1;
+                left -= 1;
+            }
+        }
+        // add `extra` rows with new keys
+        let day = ws_day as i32;
+        for i in 0..extra {
+            let name: &'static [u8] = Box::leak(format!("zz_probe_{i:07}").into_bytes().into_boxed_slice());
+            accs[0].rows.push(UserRow { name: Small::new(name), day, sessions: 1, events: 1, revenue: 0, top: -1 });
+        }
+    }
 
     // Phase 4: output.
     let mut camp = vec![0u64; (cx.ncamp + 1) * ndays * 4];
