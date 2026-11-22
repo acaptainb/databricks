@@ -33,7 +33,7 @@ const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 pub const MAX_PRICE: u64 = 10_000_000;
 
-const DB_BITS: u32 = 8; // dedup buckets, by event_id hash (top bits)
+const DB_BITS: u32 = 10; // dedup buckets, by event_id hash (top bits)
 const DB: usize = 1 << DB_BITS;
 const PP_BITS: u32 = 8; // user / person partitions (bits 40..)
 const PP: usize = 1 << PP_BITS;
@@ -52,29 +52,33 @@ fn upart(h: u64) -> usize {
 
 // ---------------------------------------------------------------- small lookup tables
 
+/// String -> index map keyed by Small (no memcmp on lookup).
 struct StrMap {
     table: HashTable<u32>,
     keys: Vec<S>,
+    sk: Vec<Small>,
 }
 
 impl StrMap {
     fn new() -> Self {
-        StrMap { table: HashTable::new(), keys: Vec::new() }
+        StrMap { table: HashTable::new(), keys: Vec::new(), sk: Vec::new() }
     }
     #[inline(always)]
-    fn get(&self, k: &[u8], h: u64) -> Option<u32> {
-        self.table.find(h, |&i| self.keys[i as usize] == k).copied()
+    fn get(&self, k: Small) -> Option<u32> {
+        self.table.find(k.h(), |&i| self.sk[i as usize] == k).copied()
     }
     fn intern(&mut self, k: S) -> u32 {
-        let h = hb(k);
-        let keys = &self.keys;
-        if let Some(&i) = self.table.find(h, |&i| keys[i as usize] == k) {
+        let s = Small::new(k);
+        let h = s.h();
+        let sk = &self.sk;
+        if let Some(&i) = self.table.find(h, |&i| sk[i as usize] == s) {
             return i;
         }
         let i = self.keys.len() as u32;
         self.keys.push(k);
-        let keys = &self.keys;
-        self.table.insert_unique(h, i, |&j| hb(keys[j as usize]));
+        self.sk.push(s);
+        let sk = &self.sk;
+        self.table.insert_unique(h, i, |&j| sk[j as usize].h());
         i
     }
 }
@@ -142,12 +146,11 @@ pub struct IdPart {
     keys: Vec<Small>,
     hashes: Vec<u64>,
     name: Vec<Small>,
-    name_h: Vec<u64>,
 }
 
 impl IdPart {
     fn new() -> Self {
-        IdPart { table: HashTable::new(), keys: Vec::new(), hashes: Vec::new(), name: Vec::new(), name_h: Vec::new() }
+        IdPart { table: HashTable::new(), keys: Vec::new(), hashes: Vec::new(), name: Vec::new() }
     }
     #[inline(always)]
     fn intern(&mut self, k: Small, h: u64) -> u32 {
@@ -191,10 +194,12 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             scan::<2>(c.data, |raw| {
                 let [a, b] = permute(raw, &c.map);
                 if !a.is_empty() && !b.is_empty() {
-                    let ha = hb(a);
-                    let hb_ = hb(b);
-                    v[upart(ha)].push((Small::new(a), ha, n * 2));
-                    v[upart(hb_)].push((Small::new(b), hb_, n * 2 + 1));
+                    let end = c.data.as_ptr_range().end;
+                    let (sa, sb) = (Small::new_in(a, end), Small::new_in(b, end));
+                    let ha = sa.h();
+                    let hb_ = sb.h();
+                    v[upart(ha)].push((sa, ha, n * 2));
+                    v[upart(hb_)].push((sb, hb_, n * 2 + 1));
                     n += 1;
                 }
             });
@@ -264,12 +269,10 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             }
         }
     }
-    let name_h: Vec<u64> = name.par_iter().map(|k| k.as_ref().map(|k| hb(k.as_bytes())).unwrap_or(0)).collect();
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
         part.name = (0..m).map(|i| name[root[b + i] as usize].unwrap()).collect();
-        part.name_h = (0..m).map(|i| name_h[root[b + i] as usize]).collect();
     });
     drop(root);
     drop(name);
@@ -277,15 +280,12 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
 }
 
 /// Flat open-addressing table of every linked ID -> (person name, name hash).
-/// One 64-byte slot per entry, so a lookup is one cache line; callers prefetch.
-#[repr(C, align(64))]
+/// 32-byte slots (two per cache line); callers prefetch.
+#[repr(C, align(32))]
 #[derive(Clone, Copy)]
 struct LSlot {
     key: Small,
     name: Small,
-    kh: u64,
-    name_h: u64,
-    _pad: [u64; 2],
 }
 
 pub struct LinkTable {
@@ -310,7 +310,7 @@ impl LinkTable {
                 while !slots[idx].key.is_empty() {
                     idx = (idx + 1) & mask;
                 }
-                slots[idx] = LSlot { key: part.keys[i], name: part.name[i], kh: h, name_h: part.name_h[i], _pad: [0; 2] };
+                slots[idx] = LSlot { key: part.keys[i], name: part.name[i] };
             }
         }
         LinkTable { slots, mask }
@@ -332,8 +332,8 @@ impl LinkTable {
             if s.key.is_empty() {
                 return (user, h);
             }
-            if s.kh == h && s.key == user {
-                return (s.name, s.name_h);
+            if s.key == user {
+                return (s.name, s.name.h());
             }
             idx = (idx + 1) & self.mask;
         }
@@ -349,7 +349,7 @@ struct Ev { // exactly one cache line
     ingest: i64,
     ts: i64,
     user: Small,
-    eid: S,
+    eid: Small,
     price: u32,
     cat: u16,
     kind: u8, // 0 invalid, 1 view, 2 cart, 3 purchase
@@ -455,13 +455,34 @@ struct Win {
 
 // ---------------------------------------------------------------- events
 
+/// 1 view, 2 cart, 3 purchase, 0 anything else (exact, case-sensitive).
+#[inline(always)]
+fn event_kind(et: &[u8]) -> u8 {
+    match et.len() {
+        4 => {
+            let w = u32::from_le_bytes(et.try_into().unwrap());
+            if w == u32::from_le_bytes(*b"view") {
+                1
+            } else if w == u32::from_le_bytes(*b"cart") {
+                2
+            } else {
+                0
+            }
+        }
+        8 => (u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase")) as u8 * 3,
+        _ => 0,
+    }
+}
+
 fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) {
+    let end = c.data.as_ptr_range().end;
     scan::<7>(c.data, |raw| {
         let [eid, user, ts, ingest, et, prod, price] = permute(raw, &c.map);
         if eid.is_empty() {
             return;
         }
-        let h = hb(eid);
+        let se = Small::new_in(eid, end);
+        let h = se.h();
         let ingest_ms = parse_ts(ingest);
         let mut kind = 0u8;
         let mut tsv = 0i64;
@@ -470,16 +491,11 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
         let mut usr = Small::new(b"");
         if let (Some(ing), Some(t)) = (ingest_ms, parse_ts(ts)) {
             if !user.is_empty() && t >= w.ws && t < w.we && !prod.is_empty() && ing - t <= LATE {
-                let k = match et {
-                    b"view" => 1,
-                    b"cart" => 2,
-                    b"purchase" => 3,
-                    _ => 0,
-                };
+                let k = event_kind(et);
                 if k == 3 {
                     if let Some(p) = parse_price(price) {
                         pr = p;
-                        cat = match prods.map.get(prod, hb(prod)) {
+                        cat = match prods.map.get(Small::new(prod)) {
                             Some(i) => prods.cat_of[i as usize],
                             None => prods.unknown,
                         };
@@ -490,7 +506,7 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
                 }
                 if kind != 0 {
                     tsv = t;
-                    usr = Small::new(user);
+                    usr = Small::new_in(user, end);
                 }
             }
         }
@@ -499,7 +515,7 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
             ingest: ingest_ms.unwrap_or(i64::MAX),
             ts: tsv,
             user: usr,
-            eid,
+            eid: se,
             price: pr,
             cat,
             kind,
@@ -572,7 +588,7 @@ fn dedup_bucket(mut parts: Vec<Vec<Ev>>, links: &LinkTable, base: i64) -> Vec<Ve
         live.clear();
         for (i, e) in v.iter().enumerate() {
             if e.dead == 0 && e.kind != 0 {
-                live.push((hb(e.user.as_bytes()), i as u32));
+                live.push((e.user.h(), i as u32));
             }
         }
         for k in 0..live.len() {
@@ -590,6 +606,7 @@ fn dedup_bucket(mut parts: Vec<Vec<Ev>>, links: &LinkTable, base: i64) -> Vec<Ve
 }
 
 fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+    let end = c.data.as_ptr_range().end;
     const B: usize = 16;
     let lo = w.ws - WEEK;
     let mut batch: [Option<CkRaw>; B] = [None; B];
@@ -610,10 +627,11 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
         if t < lo || t >= w.we {
             return;
         }
-        let Some(ci) = camps.map.get(camp, hb(camp)) else { return };
-        let uh = hb(user);
+        let Some(ci) = camps.map.get(Small::new_in(camp, end)) else { return };
+        let su = Small::new_in(user, end);
+        let uh = su.h();
         links.prefetch(uh);
-        batch[nb] = Some(CkRaw { uh, ts: t, user: Small::new(user), cid, camp: ci as u16 });
+        batch[nb] = Some(CkRaw { uh, ts: t, user: su, cid, camp: ci as u16 });
         nb += 1;
         if nb == B {
             flush(out, &mut batch, nb);
@@ -708,22 +726,122 @@ fn fix_collisions<T>(v: &mut [T], ph: impl Fn(&T) -> u64, pb: impl Fn(&T) -> Sma
     }
 }
 
-fn process_partition(acc: &mut Acc, cx: &Ctx, evs: &mut [Sv], cks: &mut [Ck]) {
-    evs.sort_unstable_by_key(|e| e.k);
-    fix_collisions(evs, |e| e.k >> TS_BITS, |e| e.person);
-    // key ascending, then click_id descending: the last click at or before a start wins
-    cks.sort_unstable_by_key(|c| c.k);
-    let mut i = 0;
-    while i < cks.len() {
-        let mut j = i + 1;
-        while j < cks.len() && cks[j].k == cks[i].k {
-            j += 1;
-        }
-        if j - i > 1 {
-            cks[i..j].sort_by(|a, b| b.cid.cmp(a.cid));
-        }
-        i = j;
+// ---------------------------------------------------------------- radix sort by key
+//
+// One counting pass and one scatter by the top RB bits of the key, then a small
+// sort inside each bucket. The result is sorted by the full key, the same order
+// a comparison sort gives, at a fraction of the cost.
+
+const RB: u32 = 12;
+const NRB: usize = 1 << RB;
+
+#[inline(always)]
+fn rbucket(k: u64) -> usize {
+    (k >> (64 - RB)) as usize
+}
+
+/// Insertion sort for the short runs, `big` (a library sort) for longer ones.
+#[inline(always)]
+fn small_sort<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool, big: impl Fn(&mut [T])) {
+    if v.len() > 48 {
+        big(v);
+        return;
     }
+    for i in 1..v.len() {
+        let x = v[i];
+        let mut j = i;
+        while j > 0 && less(&x, &v[j - 1]) {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
+fn starts_from_counts(cnt: &mut [u32]) -> usize {
+    let mut s = 0u32;
+    for c in cnt.iter_mut() {
+        let n = *c;
+        *c = s;
+        s += n;
+    }
+    s as usize
+}
+
+/// Concatenate the per-job event pairs, sorted by key.
+fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
+    let mut cnt = vec![0u32; NRB];
+    for p in &parts {
+        for pr in p {
+            cnt[rbucket(pr.0[0].k)] += 1;
+            if pr.0[1].price != u32::MAX {
+                cnt[rbucket(pr.0[1].k)] += 1;
+            }
+        }
+    }
+    let n = starts_from_counts(&mut cnt);
+    let starts = cnt.clone();
+    let mut out: Vec<Sv> = Vec::with_capacity(n);
+    let dst = out.as_mut_ptr();
+    for p in &parts {
+        for pr in p {
+            let a = pr.0[0];
+            let ba = rbucket(a.k);
+            // SAFETY: the counting pass sized every bucket; each slot is written once
+            unsafe { dst.add(cnt[ba] as usize).write(a) };
+            cnt[ba] += 1;
+            let b = pr.0[1];
+            if b.price != u32::MAX {
+                let bb = rbucket(b.k);
+                unsafe { dst.add(cnt[bb] as usize).write(b) };
+                cnt[bb] += 1;
+            }
+        }
+    }
+    drop(parts);
+    unsafe { out.set_len(n) };
+    for b in 0..NRB {
+        let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, |s| s.sort_unstable_by_key(|x| x.k));
+    }
+    out
+}
+
+/// Concatenate the per-job clicks, sorted by key and then click_id descending
+/// (so the last click at or before a session start is the winner).
+fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
+    let mut cnt = vec![0u32; NRB];
+    for p in &parts {
+        for c in p {
+            cnt[rbucket(c.k)] += 1;
+        }
+    }
+    let n = starts_from_counts(&mut cnt);
+    let starts = cnt.clone();
+    let mut out: Vec<Ck> = Vec::with_capacity(n);
+    let dst = out.as_mut_ptr();
+    for p in &parts {
+        for &c in p {
+            let b = rbucket(c.k);
+            // SAFETY: as in sorted_events
+            unsafe { dst.add(cnt[b] as usize).write(c) };
+            cnt[b] += 1;
+        }
+    }
+    drop(parts);
+    unsafe { out.set_len(n) };
+    for b in 0..NRB {
+        let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k || (x.k == y.k && x.cid > y.cid), |s| {
+            s.sort_unstable_by(|x, y| x.k.cmp(&y.k).then_with(|| y.cid.cmp(x.cid)))
+        });
+    }
+    out
+}
+
+fn process_partition(acc: &mut Acc, cx: &Ctx, evs: &mut [Sv], cks: &mut [Ck]) {
+    // evs and cks arrive sorted by key (clicks: then click_id descending)
+    fix_collisions(evs, |e| e.k >> TS_BITS, |e| e.person);
     fix_collisions(cks, |c| c.k >> TS_BITS, |c| c.person);
 
     let ndays = cx.ndays;
@@ -877,29 +995,6 @@ fn per_thread_owned<A: Send, W: Send>(items: Vec<W>, nthreads: usize, init: impl
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
-fn concat_pairs(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
-    let n: usize = parts.iter().map(|p| p.len() * 2).sum();
-    let mut v = Vec::with_capacity(n);
-    for p in parts {
-        for pr in &p {
-            v.push(pr.0[0]);
-            if pr.0[1].price != u32::MAX {
-                v.push(pr.0[1]);
-            }
-        }
-    }
-    v
-}
-
-fn concat<T: Copy>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let n: usize = parts.iter().map(|p| p.len()).sum();
-    let mut v = Vec::with_capacity(n);
-    for p in parts {
-        v.extend_from_slice(&p);
-    }
-    v
-}
-
 /// Move [job][bucket] vectors into [bucket][job].
 fn transpose<T>(v: Vec<Vec<Vec<T>>>, nb: usize) -> Vec<Vec<Vec<T>>> {
     let mut out: Vec<Vec<Vec<T>>> = (0..nb).map(|_| Vec::with_capacity(v.len())).collect();
@@ -984,8 +1079,8 @@ fn main() {
         nthreads,
         || Acc::new(&cx),
         |acc, (ev_parts, ck_parts): (Vec<Vec<SvPair>>, Vec<Vec<Ck>>)| {
-            let mut evs: Vec<Sv> = concat_pairs(ev_parts);
-            let mut cks: Vec<Ck> = concat(ck_parts);
+            let mut evs: Vec<Sv> = sorted_events(ev_parts);
+            let mut cks: Vec<Ck> = sorted_clicks(ck_parts);
             process_partition(acc, &cx, &mut evs, &mut cks);
         },
     );

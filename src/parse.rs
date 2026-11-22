@@ -190,6 +190,17 @@ const fn year_days_table() -> [i64; NY] {
     t
 }
 static YEAR_DAYS: [i64; NY] = year_days_table();
+const fn year_leap_table() -> [bool; NY] {
+    let mut t = [false; NY];
+    let mut i = 0;
+    while i < NY {
+        t[i] = is_leap(Y0 + i as i64);
+        i += 1;
+    }
+    t
+}
+static YEAR_LEAP: [bool; NY] = year_leap_table();
+static DIM: [[i64; 12]; 2] = [[31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31], [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]];
 // days before each month, [leap][month-1]
 static CUM: [[i64; 12]; 2] = [
     [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334],
@@ -240,16 +251,12 @@ pub fn parse_dt(b: &[u8]) -> Option<i64> {
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
         return None;
     }
-    let leap = is_leap(y);
-    let dim = match mo {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        _ => 28 + leap as i64,
-    };
-    if d > dim {
+    let fast = (Y0..Y0 + NY as i64).contains(&y);
+    let leap = if fast { YEAR_LEAP[(y - Y0) as usize] } else { is_leap(y) };
+    if d > DIM[leap as usize][(mo - 1) as usize] {
         return None;
     }
-    let days = if (Y0..Y0 + NY as i64).contains(&y) {
+    let days = if fast {
         YEAR_DAYS[(y - Y0) as usize] + CUM[leap as usize][(mo - 1) as usize] + d - 1
     } else {
         days_from_civil(y, mo as u32, d as u32)
