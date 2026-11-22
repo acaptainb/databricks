@@ -24,6 +24,9 @@ on:
       scaling:
         description: Also time the candidate at 1, 2 and 4 threads and the Docker start-up cost
         default: "false"
+      other:
+        description: Also build and time another implementation (GitHub owner/repo, C++ main.cpp)
+        default: ""
       perf:
         description: Also record a perf profile of the candidate
         default: "false"
@@ -138,3 +141,17 @@ jobs:
             echo "=== docker run on 20M"; sudo rm -rf out-d
             /usr/bin/time -f "  wall %e s" env CPUS=4 MEM=14g cur/scripts/docker_run.sh data out-d
           done
+
+      - name: Other implementation
+        if: ${{ inputs.other != '' }}
+        run: |
+          git clone -q --depth 1 https://github.com/${{ inputs.other }} other
+          g++ --version | head -1
+          g++ -std=c++20 -O3 -fno-tree-vectorize -march=x86-64-v3 -mtune=skylake-avx512 -Wa,-mbranches-within-32B-boundaries -static -pthread -o other-bin other/src/main.cpp
+          for i in 1 2 3; do
+            echo "=== other run $i"; rm -rf out-o; mkdir out-o
+            DATA_DIR=data OUTPUT_DIR=out-o NCPU=$(nproc) /usr/bin/time -f "  wall %e s  user %U  sys %S  maxrss %M KB" ./other-bin
+            echo "=== ours run $i"; rm -rf out-c; mkdir out-c
+            DATA_DIR=data OUTPUT_DIR=out-c NCPU=$(nproc) /usr/bin/time -f "  wall %e s  user %U  sys %S  maxrss %M KB" ./cand
+          done
+          python3 cur/scripts/compare.py out-o out-c || true
