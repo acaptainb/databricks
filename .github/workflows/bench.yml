@@ -27,6 +27,9 @@ on:
       other:
         description: Also build and time another implementation (GitHub owner/repo, C++ main.cpp)
         default: ""
+      pgo:
+        description: Build the candidate with profile-guided optimization (trained on a 2M-event set)
+        default: "false"
       perf:
         description: Also record a perf profile of the candidate
         default: "false"
@@ -74,6 +77,19 @@ jobs:
           wait
           cp cur/target/x86_64-unknown-linux-gnu/release/shopping-sessions cand
           cp base/target/x86_64-unknown-linux-gnu/release/shopping-sessions ref
+
+      - name: PGO build of the candidate
+        if: ${{ inputs.pgo == 'true' }}
+        run: |
+          rustup component add llvm-tools-preview
+          PROFDATA=$(find ~/.rustup -name llvm-profdata -type f | head -1); echo "$PROFDATA"
+          assets/generator/target/x86_64-unknown-linux-gnu/release/generate --seed 3 --events 2000000 --clicks 500000 --output train
+          FLAGS="-C target-cpu=skylake -C target-feature=+crt-static -C llvm-args=-x86-branches-within-32B-boundaries"
+          (cd cur && RUSTFLAGS="$FLAGS -C profile-generate=/tmp/pgo" cargo build --release --locked --target-dir target-pgo1)
+          rm -rf out-train; DATA_DIR=train OUTPUT_DIR=out-train NCPU=$(nproc) cur/target-pgo1/x86_64-unknown-linux-gnu/release/shopping-sessions
+          ls /tmp/pgo | head; "$PROFDATA" merge -o /tmp/pgo.profdata /tmp/pgo
+          (cd cur && RUSTFLAGS="$FLAGS -C profile-use=/tmp/pgo.profdata" cargo build --release --locked --target-dir target-pgo2)
+          cp cur/target-pgo2/x86_64-unknown-linux-gnu/release/shopping-sessions cand
 
       - name: Generate data
         run: |
