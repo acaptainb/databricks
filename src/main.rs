@@ -181,6 +181,7 @@ impl IdPart {
     }
 }
 
+#[allow(dead_code)]
 fn find(p: &mut [u32], mut x: u32) -> u32 {
     while p[x as usize] != x {
         let g = p[p[x as usize] as usize];
@@ -275,27 +276,45 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
     }
     let n = pbase[PP] as usize;
     vlog(&format!("links: parsed + interned {n} ids, {npairs} pairs"));
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    for k in 0..npairs {
+    // Lock-free parallel union-find. A root is only ever linked under a smaller
+    // root (CAS on the root's own slot), so every component's final root is its
+    // smallest index, exactly as in the serial version.
+    use std::sync::atomic::Ordering as UO;
+    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
+    let findc = |mut x: u32| -> u32 {
+        loop {
+            let px = parent[x as usize].load(UO::Relaxed);
+            if px == x {
+                return x;
+            }
+            let gp = parent[px as usize].load(UO::Relaxed);
+            if gp != px {
+                // path halving: gp is an ancestor of x
+                let _ = parent[x as usize].compare_exchange_weak(px, gp, UO::Relaxed, UO::Relaxed);
+            }
+            x = gp;
+        }
+    };
+    (0..npairs).into_par_iter().with_min_len(4096).for_each(|k| {
         let (x, y) = (local[2 * k], local[2 * k + 1]);
         let a = pbase[(x >> 24) as usize] + (x & 0xFF_FFFF);
         let b = pbase[(y >> 24) as usize] + (y & 0xFF_FFFF);
-        let ra = find(&mut parent, a);
-        let rb = find(&mut parent, b);
-        if ra != rb {
-            if ra < rb {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
+        loop {
+            let ra = findc(a);
+            let rb = findc(b);
+            if ra == rb {
+                break;
+            }
+            let (hi, lo) = if ra < rb { (rb, ra) } else { (ra, rb) };
+            if parent[hi as usize].compare_exchange(hi, lo, UO::AcqRel, UO::Relaxed).is_ok() {
+                break;
             }
         }
-    }
+    });
     drop(local);
     vlog("links: union-find done");
-    let mut root = vec![0u32; n];
-    for i in 0..n {
-        root[i] = find(&mut parent, i as u32);
-    }
+    let root: Vec<u32> = (0..n as u32).into_par_iter().with_min_len(4096).map(|i| findc(i)).collect();
+    drop(parent);
     // name = byte-wise smallest ID of the component (parallel atomic min)
     vlog("links: roots done");
     use std::sync::atomic::{AtomicU32, Ordering as AO};
@@ -728,10 +747,23 @@ impl EvAcc {
     }
 }
 
+/// True when a chunk's columns are in the standard order (no per-line permute).
+fn is_identity(map: &[u8; 8], n: usize) -> bool {
+    (0..n).all(|i| map[i] as usize == i)
+}
+
 fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
+    if is_identity(&c.map, 7) {
+        parse_event_chunk_impl::<true>(acc, c, w, prods, links, base)
+    } else {
+        parse_event_chunk_impl::<false>(acc, c, w, prods, links, base)
+    }
+}
+
+fn parse_event_chunk_impl<const IDENT: bool>(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
     let end = c.data.as_ptr_range().end;
     scan::<7>(c.data, |raw| {
-        let [eid, user, ts, ingest, et, prod, price] = permute(raw, &c.map);
+        let [eid, user, ts, ingest, et, prod, price] = if IDENT { raw } else { permute(raw, &c.map) };
         if eid.is_empty() {
             return;
         }
@@ -814,6 +846,14 @@ fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u32> {
 }
 
 fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+    if is_identity(&c.map, 4) {
+        parse_click_chunk_impl::<true>(out, c, w, camps, links)
+    } else {
+        parse_click_chunk_impl::<false>(out, c, w, camps, links)
+    }
+}
+
+fn parse_click_chunk_impl<const IDENT: bool>(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
     let end = c.data.as_ptr_range().end;
     const B: usize = 16;
     let lo = w.ws - WEEK;
@@ -827,7 +867,7 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
         }
     };
     scan::<4>(c.data, |raw| {
-        let [cid, user, camp, ts] = permute(raw, &c.map);
+        let [cid, user, camp, ts] = if IDENT { raw } else { permute(raw, &c.map) };
         if cid.is_empty() || user.is_empty() {
             return;
         }
@@ -940,7 +980,7 @@ fn fix_collisions<T>(v: &mut [T], ph: impl Fn(&T) -> u64, pb: impl Fn(&T) -> u32
 // sort inside each bucket. The result is sorted by the full key, the same order
 // a comparison sort gives, at a fraction of the cost.
 
-const RB: u32 = 12;
+const RB: u32 = 14;
 const NRB: usize = 1 << RB;
 
 #[inline(always)]

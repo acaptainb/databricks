@@ -266,12 +266,17 @@ pub fn parse_dt(b: &[u8]) -> Option<i64> {
     let da = swar_digits(a, 0x00FF_FF00_FFFF_FFFF)?;
     let dc = swar_digits(c, 0xFFFF_00FF_FF00_FFFF)?;
     let de = swar_digits(e, 0x00FF_FF00)?;
-    let y = byte(da, 0) * 1000 + byte(da, 1) * 100 + byte(da, 2) * 10 + byte(da, 3);
-    let mo = byte(da, 5) * 10 + byte(da, 6);
-    let d = byte(dc, 0) * 10 + byte(dc, 1);
-    let h = byte(dc, 3) * 10 + byte(dc, 4);
-    let mi = byte(dc, 6) * 10 + byte(dc, 7);
-    let s = byte(de, 1) * 10 + byte(de, 2);
+    // Combine digit pairs in parallel: byte k of p = 10 * d[k] + d[k+1]
+    // (digits are at most 9 and the masked-out bytes are 0, so no carries).
+    let pa = da * 10 + (da >> 8);
+    let pc = dc * 10 + (dc >> 8);
+    let pe = de * 10 + (de >> 8);
+    let y = byte(pa, 0) * 100 + byte(pa, 2);
+    let mo = byte(pa, 5);
+    let d = byte(pc, 0);
+    let h = byte(pc, 3);
+    let mi = byte(pc, 6);
+    let s = byte(pe, 1);
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || s > 59 || d < 1 {
         return None;
     }
