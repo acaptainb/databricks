@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Unit tests
+        run: cargo test --release --locked
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install polars
+        run: pip install polars
+
+      - name: Run the 36 fixtures
+        run: python3 scripts/run_fixtures.py fixtures -- ./target/x86_64-unknown-linux-gnu/release/shopping-sessions
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t shopping-sessions:latest .
+      - name: Run image on one fixture
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm --network none --read-only --user 1000:1000 \
+            -v "$PWD/fixtures/A1/input":/data:ro -v "$PWD/out":/output \
+            -e DATA_DIR=/data -e OUTPUT_DIR=/output -e NCPU=2 \
+            shopping-sessions:latest
+          find out -type f
