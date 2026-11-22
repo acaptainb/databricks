@@ -158,11 +158,12 @@ pub struct IdPart {
     raw: Vec<NRef>, // the key's bytes in the links file
     hashes: Vec<u64>,
     name: Vec<NRef>,
+    nh: Vec<u64>, // hash of the name
 }
 
 impl IdPart {
     fn new() -> Self {
-        IdPart { table: HashTable::new(), keys: Vec::new(), raw: Vec::new(), hashes: Vec::new(), name: Vec::new() }
+        IdPart { table: HashTable::new(), keys: Vec::new(), raw: Vec::new(), hashes: Vec::new(), name: Vec::new(), nh: Vec::new() }
     }
     #[inline(always)]
     fn intern(&mut self, k: Small, h: u64, raw: NRef) -> u32 {
@@ -315,15 +316,18 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         }
     });
     let allr: Vec<NRef> = parts.iter().flat_map(|p| p.raw.iter().copied()).collect();
+    let allh: Vec<u64> = parts.iter().flat_map(|p| p.hashes.iter().copied()).collect();
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
         part.name = (0..m).map(|i| allr[best[root[b + i] as usize].load(AO::Relaxed) as usize]).collect();
+        part.nh = (0..m).map(|i| allh[best[root[b + i] as usize].load(AO::Relaxed) as usize]).collect();
     });
     drop(root);
     drop(best);
     drop(all);
     drop(allr);
+    drop(allh);
     vlog("links: names done");
     let t = LinkTable::build(&parts, n);
     vlog("links: table built");
@@ -367,8 +371,8 @@ impl LinkTable {
                 while !st[idx].key.is_empty() {
                     idx = (idx + 1) & sub_mask;
                 }
-                let name = part.name[i];
-                st[idx] = LSlot { key: part.keys[i], name, nh: Small::new(name.as_bytes()).h() };
+                let (name, nh) = (part.name[i], part.nh[i]);
+                st[idx] = LSlot { key: part.keys[i], name, nh };
             }
         });
         LinkTable { slots, sub_bits: sub.trailing_zeros(), sub_mask }
@@ -972,6 +976,55 @@ fn starts_from_counts(cnt: &mut [u32]) -> usize {
     s as usize
 }
 
+/// Sort a large bucket by key. Every key in a bucket shares its top RB bits, so
+/// an LSD radix sort over the low 64 - RB bits (14 per pass, skipping passes
+/// where all keys share the digit, as for one whale person's hash bits) gives
+/// the full key order.
+fn sort_big_sv(v: &mut [Sv]) {
+    let n = v.len();
+    if n < 4096 {
+        v.sort_unstable_by_key(|x| x.k);
+        return;
+    }
+    const D: u32 = 14;
+    const ND: usize = 1 << D;
+    let mut tmp: Vec<Sv> = Vec::with_capacity(n);
+    // SAFETY: every slot of tmp is written by a scatter pass before it is read
+    unsafe { tmp.set_len(n) };
+    let mut src: *mut Sv = v.as_mut_ptr();
+    let mut dst: *mut Sv = tmp.as_mut_ptr();
+    let mut cnt = vec![0usize; ND];
+    let mut shift = 0u32;
+    while shift < 64 - RB {
+        cnt.iter_mut().for_each(|c| *c = 0);
+        for i in 0..n {
+            let k = unsafe { (*src.add(i)).k };
+            cnt[((k >> shift) as usize) & (ND - 1)] += 1;
+        }
+        if cnt.iter().any(|&c| c == n) {
+            shift += D;
+            continue;
+        }
+        let mut s = 0usize;
+        for c in cnt.iter_mut() {
+            let x = *c;
+            *c = s;
+            s += x;
+        }
+        for i in 0..n {
+            let e = unsafe { *src.add(i) };
+            let d = ((e.k >> shift) as usize) & (ND - 1);
+            unsafe { dst.add(cnt[d]).write(e) };
+            cnt[d] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        shift += D;
+    }
+    if src != v.as_mut_ptr() {
+        // SAFETY: src is tmp, fully written by the last pass
+        unsafe { std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n) };
+    }
+}
 /// Concatenate the per-job event pairs, sorted by key.
 fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
     // records marked PC_DEAD (killed by dedup) or PC_PAD (padding) are skipped
@@ -1005,7 +1058,7 @@ fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
     unsafe { out.set_len(n) };
     for b in 0..NRB {
         let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
-        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, |s| s.sort_unstable_by_key(|x| x.k));
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, sort_big_sv);
     }
     out
 }
@@ -1200,17 +1253,38 @@ fn per_thread_t<A: Send, C: Sync>(chunks: &[C], nthreads: usize, init: impl Fn(u
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
-/// Like per_thread, but consumes owned work items (so their memory is freed as they finish).
-fn per_thread_owned<A: Send, W: Send>(items: Vec<W>, nthreads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, W) + Sync) -> Vec<A> {
+/// Consume owned work items, largest first, from a shared queue: one
+/// accumulator per worker. Largest-first keeps a huge item (a whale person's
+/// partition) from starting last and leaving the other threads idle.
+fn per_thread_owned<A: Send, W: Send>(
+    mut items: Vec<W>,
+    nthreads: usize,
+    size: impl Fn(&W) -> usize,
+    init: impl Fn() -> A + Sync,
+    f: impl Fn(&mut A, W) + Sync,
+) -> Vec<A> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-    let slots: Vec<Mutex<Option<A>>> = (0..nthreads + 1).map(|_| Mutex::new(None)).collect();
-    items.into_par_iter().with_max_len(1).for_each(|w| {
-        let t = rayon::current_thread_index().unwrap_or(nthreads).min(nthreads);
-        let mut g = slots[t].lock().unwrap();
-        let acc = g.get_or_insert_with(&init);
-        f(acc, w);
-    });
-    slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
+    items.sort_by_key(|w| std::cmp::Reverse(size(w)));
+    let n = items.len();
+    let cells: Vec<Mutex<Option<W>>> = items.into_iter().map(|w| Mutex::new(Some(w))).collect();
+    let next = AtomicUsize::new(0);
+    (0..nthreads.max(1))
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|_| {
+            let mut acc = init();
+            loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let w = cells[i].lock().unwrap().take().unwrap();
+                f(&mut acc, w);
+            }
+            acc
+        })
+        .collect()
 }
 
 /// Move [job][bucket] vectors into [bucket][job].
@@ -1326,6 +1400,7 @@ fn main() {
     let accs: Vec<Acc> = per_thread_owned(
         ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
         nthreads,
+        |((ev, ck), _): &((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len()).sum::<usize>(),
         || Acc::new(&cx),
         |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| {
             for k in kills {
@@ -1383,5 +1458,6 @@ fn main() {
         accs.iter().map(|a| a.rows.len()).sum::<usize>(),
         camp_rows.len()
     ));
+    release_inputs();
     std::process::exit(0);
 }
