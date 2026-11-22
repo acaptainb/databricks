@@ -7,7 +7,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src src
 # AVX2 baseline (scorers are Cascade Lake or newer) and static linking.
 # An explicit --target keeps these flags off build scripts and proc-macros.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+# Scorers are Cascade Lake: keep branches off 32-byte boundaries (JCC erratum
+# microcode penalty), as GCC's -Wa,-mbranches-within-32B-boundaries does.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static -C llvm-args=-x86-branches-within-32B-boundaries"
 RUN cargo build --release --locked --target x86_64-unknown-linux-gnu \
  && cp target/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions \
  && (strip /shopping-sessions || true)
