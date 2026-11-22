@@ -1,5 +1,11 @@
-// A 16-byte string handle: up to 15 bytes stored inline, longer strings by pointer.
-// Inline strings compare with two integer compares and never touch the CSV memory.
+// A 16-byte string handle that compares and hashes without touching the CSV.
+//
+// Short (len <= 15): bytes inline, b[15] = len (top nibble 0).
+// Long:  b[0..8]  = 64-bit xxh3 of the bytes,
+//        b[8..14] = 48-bit pointer to the bytes,
+//        b[14..16] = 0xF000 | len (len < 4096).
+// Two long handles are equal when hash and length match, so equality, ordering
+// and hashing are a few integer ops for every ID.
 
 use crate::S;
 
@@ -9,39 +15,86 @@ pub struct Small {
     b: [u8; 16],
 }
 
-const LONG: u8 = 0xFF;
+const PTR_MASK: u64 = (1 << 48) - 1;
+
+#[inline(always)]
+fn mum(a: u64, b: u64) -> u64 {
+    let m = (a as u128) * (b as u128);
+    (m as u64) ^ ((m >> 64) as u64)
+}
 
 impl Small {
     pub const EMPTY: Small = Small { b: [0; 16] };
+
     #[inline(always)]
     pub fn new(s: S) -> Small {
-        let mut b = [0u8; 16];
         if s.len() <= 15 {
+            let mut b = [0u8; 16];
             b[..s.len()].copy_from_slice(s);
             b[15] = s.len() as u8;
+            Small { b }
         } else {
-            b[..8].copy_from_slice(&(s.as_ptr() as u64).to_le_bytes());
-            b[8..12].copy_from_slice(&(s.len() as u32).to_le_bytes());
-            b[15] = LONG;
+            Small::long(s, xxhash_rust::xxh3::xxh3_64(s))
         }
+    }
+
+    #[inline(always)]
+    fn long(s: S, h: u64) -> Small {
+        let len = s.len().min(0x0FFF) as u64;
+        let w1 = (s.as_ptr() as u64 & PTR_MASK) | ((0xF000 | len) << 48);
+        let mut b = [0u8; 16];
+        b[..8].copy_from_slice(&h.to_le_bytes());
+        b[8..].copy_from_slice(&w1.to_le_bytes());
         Small { b }
     }
+
     #[inline(always)]
     fn words(&self) -> (u64, u64) {
         (u64::from_le_bytes(self.b[..8].try_into().unwrap()), u64::from_le_bytes(self.b[8..].try_into().unwrap()))
     }
+
+    #[inline(always)]
+    fn is_long(w1: u64) -> bool {
+        w1 >> 60 == 0xF
+    }
+
     #[inline(always)]
     pub fn as_bytes(&self) -> &[u8] {
-        if self.b[15] != LONG {
+        let (_, w1) = self.words();
+        if !Self::is_long(w1) {
             &self.b[..self.b[15] as usize]
         } else {
-            let (p, l) = self.words();
-            unsafe { std::slice::from_raw_parts(p as *const u8, (l & 0xFFFF_FFFF) as usize) }
+            let p = w1 & PTR_MASK;
+            let l = ((w1 >> 48) & 0x0FFF) as usize;
+            unsafe { std::slice::from_raw_parts(p as *const u8, l) }
         }
     }
+
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.b[15] == 0
+    }
+
+    /// 64-bit hash of the ID's bytes; the same for every handle of equal bytes.
+    #[inline(always)]
+    pub fn h(&self) -> u64 {
+        let (w0, w1) = self.words();
+        if Self::is_long(w1) {
+            w0
+        } else {
+            mum(mum(w0 ^ 0xA076_1D64_78BD_642F, w1 ^ 0xE703_7ED1_A0B4_28DB) ^ 0x8EBC_6AF0_9C88_C6E3, 0x5899_65CC_7537_4CC3)
+        }
+    }
+
+    /// Identity key: equal for equal IDs, a consistent total order otherwise.
+    #[inline(always)]
+    fn okey(&self) -> (u64, u64) {
+        let (w0, w1) = self.words();
+        if Self::is_long(w1) {
+            (w1 >> 48, w0)
+        } else {
+            (w1, w0)
+        }
     }
 }
 
@@ -50,11 +103,10 @@ impl PartialEq for Small {
     fn eq(&self, o: &Small) -> bool {
         let (a0, a1) = self.words();
         let (b0, b1) = o.words();
-        if a0 == b0 && a1 == b1 {
-            return true;
+        if a1 == b1 {
+            return a0 == b0;
         }
-        // differing words: equal only when both are long and their bytes match
-        self.b[15] == LONG && o.b[15] == LONG && self.as_bytes() == o.as_bytes()
+        Self::is_long(a1) && a0 == b0 && (a1 >> 48) == (b1 >> 48)
     }
 }
 impl Eq for Small {}
@@ -64,13 +116,39 @@ impl PartialOrd for Small {
         Some(self.cmp(o))
     }
 }
+/// Not byte order: only a consistent total order for grouping. Byte order,
+/// where the rules need it, uses `as_bytes()`.
 impl Ord for Small {
     #[inline(always)]
     fn cmp(&self, o: &Small) -> std::cmp::Ordering {
-        if self == o {
-            std::cmp::Ordering::Equal
-        } else {
-            self.as_bytes().cmp(o.as_bytes())
-        }
+        self.okey().cmp(&o.okey())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn leak(s: &str) -> S {
+        Box::leak(s.as_bytes().to_vec().into_boxed_slice())
+    }
+    #[test]
+    fn long_and_short_identity() {
+        let a = Small::new(leak("u_0123456789abcdef0123456789abcdef"));
+        let b = Small::new(leak("u_0123456789abcdef0123456789abcdef"));
+        let c = Small::new(leak("u_0123456789abcdef0123456789abcdee"));
+        assert!(a == b && a.h() == b.h() && a.cmp(&b).is_eq());
+        assert!(a != c && a.cmp(&c).is_ne());
+        assert_eq!(a.as_bytes(), b"u_0123456789abcdef0123456789abcdef");
+        let s = Small::new(leak("u1"));
+        let t = Small::new(leak("u1"));
+        let u = Small::new(leak("U1"));
+        assert!(s == t && s.h() == t.h() && s != u && s != a && a != s);
+        assert_eq!(s.as_bytes(), b"u1");
+        assert!(Small::new(b"").is_empty() && !s.is_empty() && !a.is_empty());
+        let x = Small::new(leak("abcdefghijklmno")); // 15: inline
+        let y = Small::new(leak("abcdefghijklmnop")); // 16: long
+        assert_eq!(x.as_bytes(), b"abcdefghijklmno");
+        assert_eq!(y.as_bytes(), b"abcdefghijklmnop");
+        assert!(x != y);
     }
 }

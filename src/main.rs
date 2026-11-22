@@ -191,10 +191,11 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             scan::<2>(c.data, |raw| {
                 let [a, b] = permute(raw, &c.map);
                 if !a.is_empty() && !b.is_empty() {
-                    let ha = hb(a);
-                    let hb_ = hb(b);
-                    v[upart(ha)].push((Small::new(a), ha, n * 2));
-                    v[upart(hb_)].push((Small::new(b), hb_, n * 2 + 1));
+                    let (sa, sb) = (Small::new(a), Small::new(b));
+                    let ha = sa.h();
+                    let hb_ = sb.h();
+                    v[upart(ha)].push((sa, ha, n * 2));
+                    v[upart(hb_)].push((sb, hb_, n * 2 + 1));
                     n += 1;
                 }
             });
@@ -264,7 +265,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             }
         }
     }
-    let name_h: Vec<u64> = name.par_iter().map(|k| k.as_ref().map(|k| hb(k.as_bytes())).unwrap_or(0)).collect();
+    let name_h: Vec<u64> = name.par_iter().map(|k| k.as_ref().map(|k| k.h()).unwrap_or(0)).collect();
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
@@ -572,7 +573,7 @@ fn dedup_bucket(mut parts: Vec<Vec<Ev>>, links: &LinkTable, base: i64) -> Vec<Ve
         live.clear();
         for (i, e) in v.iter().enumerate() {
             if e.dead == 0 && e.kind != 0 {
-                live.push((hb(e.user.as_bytes()), i as u32));
+                live.push((e.user.h(), i as u32));
             }
         }
         for k in 0..live.len() {
@@ -611,9 +612,10 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
             return;
         }
         let Some(ci) = camps.map.get(camp, hb(camp)) else { return };
-        let uh = hb(user);
+        let su = Small::new(user);
+        let uh = su.h();
         links.prefetch(uh);
-        batch[nb] = Some(CkRaw { uh, ts: t, user: Small::new(user), cid, camp: ci as u16 });
+        batch[nb] = Some(CkRaw { uh, ts: t, user: su, cid, camp: ci as u16 });
         nb += 1;
         if nb == B {
             flush(out, &mut batch, nb);
@@ -708,22 +710,128 @@ fn fix_collisions<T>(v: &mut [T], ph: impl Fn(&T) -> u64, pb: impl Fn(&T) -> Sma
     }
 }
 
-fn process_partition(acc: &mut Acc, cx: &Ctx, evs: &mut [Sv], cks: &mut [Ck]) {
-    evs.sort_unstable_by_key(|e| e.k);
-    fix_collisions(evs, |e| e.k >> TS_BITS, |e| e.person);
-    // key ascending, then click_id descending: the last click at or before a start wins
-    cks.sort_unstable_by_key(|c| c.k);
-    let mut i = 0;
-    while i < cks.len() {
-        let mut j = i + 1;
-        while j < cks.len() && cks[j].k == cks[i].k {
-            j += 1;
-        }
-        if j - i > 1 {
-            cks[i..j].sort_by(|a, b| b.cid.cmp(a.cid));
-        }
-        i = j;
+// ---------------------------------------------------------------- radix sort by key
+//
+// One counting pass and one scatter by the top RB bits of the key, then a small
+// sort inside each bucket. The result is sorted by the full key, the same order
+// a comparison sort gives, at a fraction of the cost.
+
+const RB: u32 = 12;
+const NRB: usize = 1 << RB;
+
+#[inline(always)]
+fn rbucket(k: u64) -> usize {
+    (k >> (64 - RB)) as usize
+}
+
+/// Insertion sort for the short runs, a library sort for longer ones.
+#[inline(always)]
+fn small_sort<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
+    if v.len() > 48 {
+        v.sort_unstable_by(|a, b| {
+            if less(a, b) {
+                std::cmp::Ordering::Less
+            } else if less(b, a) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        return;
     }
+    for i in 1..v.len() {
+        let x = v[i];
+        let mut j = i;
+        while j > 0 && less(&x, &v[j - 1]) {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+    }
+}
+
+fn starts_from_counts(cnt: &mut [u32]) -> usize {
+    let mut s = 0u32;
+    for c in cnt.iter_mut() {
+        let n = *c;
+        *c = s;
+        s += n;
+    }
+    s as usize
+}
+
+/// Concatenate the per-job event pairs, sorted by key.
+fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
+    let mut cnt = vec![0u32; NRB];
+    for p in &parts {
+        for pr in p {
+            cnt[rbucket(pr.0[0].k)] += 1;
+            if pr.0[1].price != u32::MAX {
+                cnt[rbucket(pr.0[1].k)] += 1;
+            }
+        }
+    }
+    let n = starts_from_counts(&mut cnt);
+    let starts = cnt.clone();
+    let mut out: Vec<Sv> = Vec::with_capacity(n);
+    let dst = out.as_mut_ptr();
+    for p in &parts {
+        for pr in p {
+            let a = pr.0[0];
+            let ba = rbucket(a.k);
+            // SAFETY: the counting pass sized every bucket; each slot is written once
+            unsafe { dst.add(cnt[ba] as usize).write(a) };
+            cnt[ba] += 1;
+            let b = pr.0[1];
+            if b.price != u32::MAX {
+                let bb = rbucket(b.k);
+                unsafe { dst.add(cnt[bb] as usize).write(b) };
+                cnt[bb] += 1;
+            }
+        }
+    }
+    drop(parts);
+    unsafe { out.set_len(n) };
+    for b in 0..NRB {
+        let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k);
+    }
+    out
+}
+
+/// Concatenate the per-job clicks, sorted by key and then click_id descending
+/// (so the last click at or before a session start is the winner).
+fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
+    let mut cnt = vec![0u32; NRB];
+    for p in &parts {
+        for c in p {
+            cnt[rbucket(c.k)] += 1;
+        }
+    }
+    let n = starts_from_counts(&mut cnt);
+    let starts = cnt.clone();
+    let mut out: Vec<Ck> = Vec::with_capacity(n);
+    let dst = out.as_mut_ptr();
+    for p in &parts {
+        for &c in p {
+            let b = rbucket(c.k);
+            // SAFETY: as in sorted_events
+            unsafe { dst.add(cnt[b] as usize).write(c) };
+            cnt[b] += 1;
+        }
+    }
+    drop(parts);
+    unsafe { out.set_len(n) };
+    for b in 0..NRB {
+        let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k || (x.k == y.k && x.cid > y.cid));
+    }
+    out
+}
+
+fn process_partition(acc: &mut Acc, cx: &Ctx, evs: &mut [Sv], cks: &mut [Ck]) {
+    // evs and cks arrive sorted by key (clicks: then click_id descending)
+    fix_collisions(evs, |e| e.k >> TS_BITS, |e| e.person);
     fix_collisions(cks, |c| c.k >> TS_BITS, |c| c.person);
 
     let ndays = cx.ndays;
@@ -877,29 +985,6 @@ fn per_thread_owned<A: Send, W: Send>(items: Vec<W>, nthreads: usize, init: impl
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
-fn concat_pairs(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
-    let n: usize = parts.iter().map(|p| p.len() * 2).sum();
-    let mut v = Vec::with_capacity(n);
-    for p in parts {
-        for pr in &p {
-            v.push(pr.0[0]);
-            if pr.0[1].price != u32::MAX {
-                v.push(pr.0[1]);
-            }
-        }
-    }
-    v
-}
-
-fn concat<T: Copy>(parts: Vec<Vec<T>>) -> Vec<T> {
-    let n: usize = parts.iter().map(|p| p.len()).sum();
-    let mut v = Vec::with_capacity(n);
-    for p in parts {
-        v.extend_from_slice(&p);
-    }
-    v
-}
-
 /// Move [job][bucket] vectors into [bucket][job].
 fn transpose<T>(v: Vec<Vec<Vec<T>>>, nb: usize) -> Vec<Vec<Vec<T>>> {
     let mut out: Vec<Vec<Vec<T>>> = (0..nb).map(|_| Vec::with_capacity(v.len())).collect();
@@ -984,8 +1069,8 @@ fn main() {
         nthreads,
         || Acc::new(&cx),
         |acc, (ev_parts, ck_parts): (Vec<Vec<SvPair>>, Vec<Vec<Ck>>)| {
-            let mut evs: Vec<Sv> = concat_pairs(ev_parts);
-            let mut cks: Vec<Ck> = concat(ck_parts);
+            let mut evs: Vec<Sv> = sorted_events(ev_parts);
+            let mut cks: Vec<Ck> = sorted_clicks(ck_parts);
             process_partition(acc, &cx, &mut evs, &mut cks);
         },
     );
