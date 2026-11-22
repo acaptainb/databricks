@@ -153,6 +153,26 @@ fn col_str<'a>(name: &'static str, vals: impl Iterator<Item = &'a [u8]>, cap: us
     Col { name, ty: T_BYTE_ARRAY, rep: REQUIRED, conv: Some(CT_UTF8), body }
 }
 
+/// The user_id column. Names point into the mapped input at random places,
+/// so each one is prefetched a few rows ahead: the cache misses overlap
+/// instead of queueing one after another.
+fn col_names(name: &'static str, rows: &[UserRow], cap: usize) -> Col {
+    const D: usize = 16;
+    let mut body = Vec::with_capacity(cap);
+    for i in 0..rows.len() {
+        if i + D < rows.len() {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(rows[i + D].name.as_bytes().as_ptr() as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
+        }
+        let s = rows[i].name.as_bytes();
+        body.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        body.extend_from_slice(s);
+    }
+    Col { name, ty: T_BYTE_ARRAY, rep: REQUIRED, conv: Some(CT_UTF8), body }
+}
+
 /// An optional string column: v1 definition levels (bit width 1, one
 /// bit-packed run, 4-byte length prefix), then PLAIN values of the non-null rows.
 fn col_opt_str<'a>(name: &'static str, vals: impl Iterator<Item = Option<&'a [u8]>>, n: usize) -> Col {
@@ -261,7 +281,7 @@ pub fn write_user(path: &Path, rows: &[UserRow], cats: &[S]) {
     let n = rows.len();
     let name_bytes: usize = rows.iter().map(|r| r.name.as_bytes().len() + 4).sum();
     let cols = vec![
-        col_str("user_id", rows.iter().map(|r| r.name.as_bytes()), name_bytes),
+        col_names("user_id", rows, name_bytes),
         col_date("day", rows.iter().map(|r| r.day), n),
         col_i32("sessions", rows.iter().map(|r| r.sessions as i32), n),
         col_i32("events", rows.iter().map(|r| r.events as i32), n),
