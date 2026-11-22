@@ -980,7 +980,7 @@ fn fix_collisions<T>(v: &mut [T], ph: impl Fn(&T) -> u64, pb: impl Fn(&T) -> u32
 // sort inside each bucket. The result is sorted by the full key, the same order
 // a comparison sort gives, at a fraction of the cost.
 
-const RB: u32 = 12;
+const RB: u32 = 14;
 const NRB: usize = 1 << RB;
 
 #[inline(always)]
