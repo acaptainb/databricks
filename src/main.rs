@@ -35,8 +35,11 @@ pub const MAX_PRICE: u64 = 10_000_000;
 
 const DB_BITS: u32 = 10; // dedup buckets, by event_id hash (top bits)
 const DB: usize = 1 << DB_BITS;
-const PP_BITS: u32 = 8; // user / person partitions (bits 40..)
+const PP_BITS: u32 = 9; // user / person partitions (bits 40..)
 const PP: usize = 1 << PP_BITS;
+/// Link-build side encoding: partition << LINK_SHIFT | index within the partition.
+const LINK_SHIFT: u32 = 32 - PP_BITS;
+const LINK_MASK: u32 = (1 << LINK_SHIFT) - 1;
 pub const CHUNK: usize = 4 << 20;
 
 
@@ -262,7 +265,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         chunk_base.push(npairs);
         npairs += n;
     }
-    // per side: partition << 24 | local index in that partition
+    // per side: partition << LINK_SHIFT | local index in that partition
     let mut local = vec![0u32; npairs * 2];
     let lp = SendPtr(local.as_mut_ptr());
     let lp = &lp;
@@ -275,7 +278,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
                 for &(k, h, slot, raw) in &v[p] {
                     let i = part.intern(k, h, raw);
                     // SAFETY: every slot is written by exactly one partition
-                    unsafe { *lp.0.add((base + slot) as usize) = ((p as u32) << 24) | i };
+                    unsafe { *lp.0.add((base + slot) as usize) = ((p as u32) << LINK_SHIFT) | i };
                 }
             }
             part
@@ -311,8 +314,8 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
     };
     (0..npairs).into_par_iter().with_min_len(4096).for_each(|k| {
         let (x, y) = (local[2 * k], local[2 * k + 1]);
-        let a = pbase[(x >> 24) as usize] + (x & 0xFF_FFFF);
-        let b = pbase[(y >> 24) as usize] + (y & 0xFF_FFFF);
+        let a = pbase[(x >> LINK_SHIFT) as usize] + (x & LINK_MASK);
+        let b = pbase[(y >> LINK_SHIFT) as usize] + (y & LINK_MASK);
         loop {
             let ra = findc(a);
             let rb = findc(b);
@@ -1000,7 +1003,7 @@ fn fix_collisions<T>(v: &mut [T], ph: impl Fn(&T) -> u64, pb: impl Fn(&T) -> u32
 // sort inside each bucket. The result is sorted by the full key, the same order
 // a comparison sort gives, at a fraction of the cost.
 
-const RB: u32 = 14;
+const RB: u32 = 13;
 const NRB: usize = 1 << RB;
 
 #[inline(always)]
