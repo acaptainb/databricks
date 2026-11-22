@@ -61,7 +61,8 @@ jobs:
 
       - name: Build candidate and reference
         run: |
-          git -C cur worktree add ../base ${{ inputs.base }}
+          B="${{ inputs.base }}"; git -C cur rev-parse -q --verify "$B^{commit}" >/dev/null || B="origin/$B"
+          git -C cur worktree add --detach ../base "$B"
           (cd cur && cargo build --release --locked) &
           (cd base && cargo build --release --locked) &
           wait
