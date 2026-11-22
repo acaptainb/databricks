@@ -106,6 +106,6 @@ jobs:
           cp cur/target/x86_64-unknown-linux-gnu/release/shopping-sessions prof
           rm -rf out-p; DATA_DIR=data OUTPUT_DIR=out-p NCPU=$(nproc) perf record -F 2999 -g -o perf.data ./prof 2>/dev/null
           echo "===== by symbol"
-          perf report -i perf.data --no-children --sort sym --stdio 2>/dev/null | grep -v '^#' | grep '%' | head -40
+          perf report -i perf.data --no-children --sort sym --stdio -g none 2>/dev/null | grep -v "^#" | grep "%" | head -45
           echo "===== by source line"
           perf report -i perf.data --no-children --sort srcline --stdio -g none 2>/dev/null | grep -v '^#' | grep '%' | head -70
