@@ -728,10 +728,23 @@ impl EvAcc {
     }
 }
 
+/// True when a chunk's columns are in the standard order (no per-line permute).
+fn is_identity(map: &[u8; 8], n: usize) -> bool {
+    (0..n).all(|i| map[i] as usize == i)
+}
+
 fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
+    if is_identity(&c.map, 7) {
+        parse_event_chunk_impl::<true>(acc, c, w, prods, links, base)
+    } else {
+        parse_event_chunk_impl::<false>(acc, c, w, prods, links, base)
+    }
+}
+
+fn parse_event_chunk_impl<const IDENT: bool>(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
     let end = c.data.as_ptr_range().end;
     scan::<7>(c.data, |raw| {
-        let [eid, user, ts, ingest, et, prod, price] = permute(raw, &c.map);
+        let [eid, user, ts, ingest, et, prod, price] = if IDENT { raw } else { permute(raw, &c.map) };
         if eid.is_empty() {
             return;
         }
@@ -814,6 +827,14 @@ fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u32> {
 }
 
 fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+    if is_identity(&c.map, 4) {
+        parse_click_chunk_impl::<true>(out, c, w, camps, links)
+    } else {
+        parse_click_chunk_impl::<false>(out, c, w, camps, links)
+    }
+}
+
+fn parse_click_chunk_impl<const IDENT: bool>(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
     let end = c.data.as_ptr_range().end;
     const B: usize = 16;
     let lo = w.ws - WEEK;
@@ -827,7 +848,7 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
         }
     };
     scan::<4>(c.data, |raw| {
-        let [cid, user, camp, ts] = permute(raw, &c.map);
+        let [cid, user, camp, ts] = if IDENT { raw } else { permute(raw, &c.map) };
         if cid.is_empty() || user.is_empty() {
             return;
         }
