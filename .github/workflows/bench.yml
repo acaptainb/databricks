@@ -18,6 +18,9 @@ on:
       seed:
         description: Generator seed
         default: "7"
+      cand_env:
+        description: Extra environment for candidate runs only (A/B of settings)
+        default: ""
       perf:
         description: Also record a perf profile of the candidate
         default: "false"
@@ -75,7 +78,8 @@ jobs:
 
       - name: Time reference and candidate
         run: |
-          run() { rm -rf "$2"; mkdir -p "$2"; DATA_DIR=data OUTPUT_DIR="$2" NCPU=$(nproc) SS_VERBOSE=1 \
+          run() { rm -rf "$2"; mkdir -p "$2"; E=""; if [ "$1" = cand ]; then E="${{ inputs.cand_env }}"; fi
+                  env $E DATA_DIR=data OUTPUT_DIR="$2" NCPU=$(nproc) SS_VERBOSE=1 \
                   /usr/bin/time -f "  wall %e s  user %U  sys %S  maxrss %M KB" ./"$1"; }
           cat data/events/*.csv data/clicks/*.csv data/links/*.csv > /dev/null
           for i in 1 2 3; do
