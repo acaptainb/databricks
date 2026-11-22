@@ -142,12 +142,11 @@ pub struct IdPart {
     keys: Vec<Small>,
     hashes: Vec<u64>,
     name: Vec<Small>,
-    name_h: Vec<u64>,
 }
 
 impl IdPart {
     fn new() -> Self {
-        IdPart { table: HashTable::new(), keys: Vec::new(), hashes: Vec::new(), name: Vec::new(), name_h: Vec::new() }
+        IdPart { table: HashTable::new(), keys: Vec::new(), hashes: Vec::new(), name: Vec::new() }
     }
     #[inline(always)]
     fn intern(&mut self, k: Small, h: u64) -> u32 {
@@ -265,12 +264,10 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             }
         }
     }
-    let name_h: Vec<u64> = name.par_iter().map(|k| k.as_ref().map(|k| k.h()).unwrap_or(0)).collect();
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
         part.name = (0..m).map(|i| name[root[b + i] as usize].unwrap()).collect();
-        part.name_h = (0..m).map(|i| name_h[root[b + i] as usize]).collect();
     });
     drop(root);
     drop(name);
@@ -278,15 +275,12 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
 }
 
 /// Flat open-addressing table of every linked ID -> (person name, name hash).
-/// One 64-byte slot per entry, so a lookup is one cache line; callers prefetch.
-#[repr(C, align(64))]
+/// 32-byte slots (two per cache line); callers prefetch.
+#[repr(C, align(32))]
 #[derive(Clone, Copy)]
 struct LSlot {
     key: Small,
     name: Small,
-    kh: u64,
-    name_h: u64,
-    _pad: [u64; 2],
 }
 
 pub struct LinkTable {
@@ -311,7 +305,7 @@ impl LinkTable {
                 while !slots[idx].key.is_empty() {
                     idx = (idx + 1) & mask;
                 }
-                slots[idx] = LSlot { key: part.keys[i], name: part.name[i], kh: h, name_h: part.name_h[i], _pad: [0; 2] };
+                slots[idx] = LSlot { key: part.keys[i], name: part.name[i] };
             }
         }
         LinkTable { slots, mask }
@@ -333,8 +327,8 @@ impl LinkTable {
             if s.key.is_empty() {
                 return (user, h);
             }
-            if s.kh == h && s.key == user {
-                return (s.name, s.name_h);
+            if s.key == user {
+                return (s.name, s.name.h());
             }
             idx = (idx + 1) & self.mask;
         }
