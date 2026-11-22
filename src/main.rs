@@ -39,6 +39,17 @@ const PP_BITS: u32 = 8; // user / person partitions (bits 40..)
 const PP: usize = 1 << PP_BITS;
 pub const CHUNK: usize = 4 << 20;
 
+
+static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Timestamped stage note on stderr when SS_VERBOSE is set.
+fn vlog(m: &str) {
+    if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        let t = T0.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        eprintln!("    [{t:7.3}s] {m}");
+    }
+}
 #[inline(always)]
 pub fn hb(b: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(b)
@@ -176,7 +187,6 @@ fn find(p: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
-const _: () = assert!(std::mem::size_of::<Ev>() == 64);
 const _: () = assert!(std::mem::size_of::<Sv>() == 32);
 
 struct SendPtr<T>(*mut T);
@@ -184,7 +194,7 @@ unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
 fn build_links(files: &[S]) -> (LinkTable, usize) {
-    let chunks = make_chunks::<2>(files, &["user_id_a", "user_id_b"]);
+    let chunks = make_chunks_sized::<2>(files, &["user_id_a", "user_id_b"], 1 << 19);
     // parse, and scatter each side by hash partition: (id, hash, slot = pair*2+side)
     let parsed: Vec<(usize, Vec<Vec<(Small, u64, u32)>>)> = chunks
         .par_iter()
@@ -237,6 +247,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         pbase[p + 1] = pbase[p] + parts[p].keys.len() as u32;
     }
     let n = pbase[PP] as usize;
+    vlog(&format!("links: parsed + interned {n} ids, {npairs} pairs"));
     let mut parent: Vec<u32> = (0..n as u32).collect();
     for k in 0..npairs {
         let (x, y) = (local[2 * k], local[2 * k + 1]);
@@ -253,30 +264,42 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         }
     }
     drop(local);
+    vlog("links: union-find done");
     let mut root = vec![0u32; n];
     for i in 0..n {
         root[i] = find(&mut parent, i as u32);
     }
-    // name = byte-wise smallest ID of the component
-    let mut name: Vec<Option<Small>> = vec![None; n];
-    for (p, part) in parts.iter().enumerate() {
-        let b = pbase[p] as usize;
-        for (i, k) in part.keys.iter().enumerate() {
-            let r = root[b + i] as usize;
-            match &name[r] {
-                Some(cur) if cur.as_bytes() <= k.as_bytes() => {}
-                _ => name[r] = Some(*k),
+    // name = byte-wise smallest ID of the component (parallel atomic min)
+    vlog("links: roots done");
+    use std::sync::atomic::{AtomicU32, Ordering as AO};
+    let all: Vec<Small> = parts.iter().flat_map(|p| p.keys.iter().copied()).collect();
+    let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
+    (0..n).into_par_iter().with_min_len(4096).for_each(|g| {
+        let r = root[g] as usize;
+        let kb = all[g].as_bytes();
+        let mut cur = best[r].load(AO::Relaxed);
+        loop {
+            if cur != u32::MAX && all[cur as usize].as_bytes() <= kb {
+                break;
+            }
+            match best[r].compare_exchange_weak(cur, g as u32, AO::Relaxed, AO::Relaxed) {
+                Ok(_) => break,
+                Err(c) => cur = c,
             }
         }
-    }
+    });
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
-        part.name = (0..m).map(|i| name[root[b + i] as usize].unwrap()).collect();
+        part.name = (0..m).map(|i| all[best[root[b + i] as usize].load(AO::Relaxed) as usize]).collect();
     });
     drop(root);
-    drop(name);
-    (LinkTable::build(&parts, n), n)
+    drop(best);
+    drop(all);
+    vlog("links: names done");
+    let t = LinkTable::build(&parts, n);
+    vlog("links: table built");
+    (t, n)
 }
 
 /// Flat open-addressing table of every linked ID -> (person name, name hash).
@@ -290,71 +313,66 @@ struct LSlot {
 
 pub struct LinkTable {
     slots: &'static [LSlot],
-    mask: usize,
+    sub_bits: u32,
+    sub_mask: usize,
 }
 
+/// The table is PP independent open-addressing sub-tables, one per ID hash
+/// partition (the same partitions build_links interns into), so every
+/// sub-table is built in parallel. A lookup is still one cache line.
 impl LinkTable {
-    fn build(parts: &[IdPart], n: usize) -> LinkTable {
-        let cap = (n * 2).next_power_of_two().max(64);
+    fn build(parts: &[IdPart], _n: usize) -> LinkTable {
+        let maxk = parts.iter().map(|p| p.keys.len()).max().unwrap_or(0);
+        let sub = (maxk * 2).next_power_of_two().max(64);
+        let cap = sub * PP;
         let bytes = cap * std::mem::size_of::<LSlot>();
         let m = memmap2::MmapMut::map_anon(bytes).expect("anon map");
         let _ = m.advise(memmap2::Advice::HugePage);
         let m: &'static mut memmap2::MmapMut = Box::leak(Box::new(m));
         // SAFETY: zeroed memory is a valid array of empty slots (key length 0)
         let slots: &'static mut [LSlot] = unsafe { std::slice::from_raw_parts_mut(m.as_mut_ptr() as *mut LSlot, cap) };
-        let mask = cap - 1;
-        for part in parts {
+        let sub_mask = sub - 1;
+        slots.par_chunks_mut(sub).zip(parts.par_iter()).for_each(|(st, part)| {
             for i in 0..part.keys.len() {
-                let h = part.hashes[i];
-                let mut idx = (h as usize) & mask;
-                while !slots[idx].key.is_empty() {
-                    idx = (idx + 1) & mask;
+                let mut idx = (part.hashes[i] as usize) & sub_mask;
+                while !st[idx].key.is_empty() {
+                    idx = (idx + 1) & sub_mask;
                 }
-                slots[idx] = LSlot { key: part.keys[i], name: part.name[i] };
+                st[idx] = LSlot { key: part.keys[i], name: part.name[i] };
             }
-        }
-        LinkTable { slots, mask }
+        });
+        LinkTable { slots, sub_bits: sub.trailing_zeros(), sub_mask }
+    }
+    #[inline(always)]
+    fn slot_of(&self, h: u64) -> usize {
+        (upart(h) << self.sub_bits) | ((h as usize) & self.sub_mask)
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            _mm_prefetch(self.slots.as_ptr().add((h as usize) & self.mask) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.slots.as_ptr().add(self.slot_of(h)) as *const i8, _MM_HINT_T0);
         }
     }
     /// Person (name, name hash) of a user ID; an unlinked ID is its own person.
     #[inline(always)]
     fn person(&self, user: Small, h: u64) -> (Small, u64) {
-        let mut idx = (h as usize) & self.mask;
+        let base = upart(h) << self.sub_bits;
+        let mut idx = (h as usize) & self.sub_mask;
         loop {
-            let s = &self.slots[idx];
+            let s = &self.slots[base + idx];
             if s.key.is_empty() {
                 return (user, h);
             }
             if s.key == user {
                 return (s.name, s.name.h());
             }
-            idx = (idx + 1) & self.mask;
+            idx = (idx + 1) & self.sub_mask;
         }
     }
 }
-
 // ---------------------------------------------------------------- records
-
-#[derive(Clone, Copy)]
-#[repr(C, align(64))]
-struct Ev { // exactly one cache line
-    h: u64,
-    ingest: i64,
-    ts: i64,
-    user: Small,
-    eid: Small,
-    price: u32,
-    cat: u16,
-    kind: u8, // 0 invalid, 1 view, 2 cart, 3 purchase
-    dead: u8,
-}
 
 /// Sort key: 24 bits of the person hash, then 40 bits of time relative to
 /// window_start - 7 days. Sorting by it groups persons (hash collisions are
@@ -381,7 +399,7 @@ struct Sv {
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 struct SvPair([Sv; 2]);
-const SV_PAD: Sv = Sv { k: 0, person: Small::EMPTY, price: u32::MAX, cat: 0 };
+const SV_PAD: Sv = Sv { k: 0, person: Small::EMPTY, price: PRICE_PAD, cat: 0 };
 
 /// Per-destination staging so every store to memory is a full cache line.
 struct PairScatter {
@@ -418,10 +436,11 @@ impl PairScatter {
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
         v.push(pair);
     }
-    fn finish(self, out: &mut [Vec<SvPair>]) {
-        for (dst, &h) in self.has.iter().enumerate() {
-            if h {
+    fn finish(&mut self, out: &mut [Vec<SvPair>]) {
+        for dst in 0..self.has.len() {
+            if self.has[dst] {
                 out[dst].push(SvPair([self.pending[dst], SV_PAD]));
+                self.has[dst] = false;
             }
         }
         #[cfg(target_arch = "x86_64")]
@@ -474,7 +493,143 @@ fn event_kind(et: &[u8]) -> u8 {
     }
 }
 
-fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) {
+// ---------------------------------------------------------------- fused event pass
+//
+// One pass over the event CSV. A valid copy is resolved to its person right away
+// and written once, as a 32-byte session record, into that person's partition.
+// Every copy (valid or not) also writes a 24-byte dedup key to its event_id
+// bucket. Dedup then runs over the keys alone and returns the locations of the
+// losing copies, which the session pass skips.
+
+/// Location of a session record: thread slot << 56 | partition << 32 | index.
+const LOC_INVALID: u64 = u64::MAX; // the copy failed validation: no record
+const LOC_PAD: u64 = u64::MAX - 1; // block padding, not a copy
+
+/// Session-record price sentinels (real prices are at most MAX_PRICE).
+const PRICE_DEAD: u32 = u32::MAX - 1; // killed by dedup
+const PRICE_PAD: u32 = u32::MAX; // pair padding (SV_PAD)
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct DKey {
+    h: u64,
+    h2: u32,
+    ingest: u32, // epoch seconds (ingest_ts is whole seconds)
+    loc: u64,
+}
+const DKEY_PAD: DKey = DKey { h: 0, h2: 0, ingest: u32::MAX, loc: LOC_PAD };
+
+/// Eight keys: three full cache lines, written with non-temporal stores.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct DBlock([DKey; 8]);
+const _: () = assert!(std::mem::size_of::<DBlock>() == 192);
+
+/// A valid copy waiting for its person lookup (batched so lookups overlap).
+#[derive(Clone, Copy)]
+struct Pend {
+    uh: u64,
+    user: Small,
+    ts: i64,
+    h: u64,
+    h2: u32,
+    ingest: u32,
+    price: u32,
+    cat: u16,
+}
+
+const PEND_BATCH: usize = 16;
+
+struct EvAcc {
+    t: u64,
+    sv: Vec<Vec<SvPair>>, // [partition]
+    sv_cnt: Vec<u32>,
+    sc: PairScatter,
+    dk: Vec<Vec<DBlock>>, // [dedup bucket]
+    st: Vec<DBlock>,
+    st_n: Vec<u8>,
+    pend: Vec<Pend>,
+}
+
+impl EvAcc {
+    fn new(t: usize, sv_cap: usize, dk_cap: usize) -> EvAcc {
+        EvAcc {
+            t: t as u64,
+            sv: (0..PP).map(|_| Vec::with_capacity(sv_cap)).collect(),
+            sv_cnt: vec![0; PP],
+            sc: PairScatter::new(PP),
+            dk: (0..DB).map(|_| Vec::with_capacity(dk_cap)).collect(),
+            st: vec![DBlock([DKEY_PAD; 8]); DB],
+            st_n: vec![0; DB],
+            pend: Vec::with_capacity(PEND_BATCH),
+        }
+    }
+
+    #[inline(always)]
+    fn push_key(&mut self, k: DKey) {
+        let b = (k.h >> (64 - DB_BITS)) as usize;
+        let n = self.st_n[b] as usize;
+        self.st[b].0[n] = k;
+        if n < 7 {
+            self.st_n[b] = (n + 1) as u8;
+            return;
+        }
+        self.st_n[b] = 0;
+        let v = &mut self.dk[b];
+        if v.len() == v.capacity() {
+            v.reserve(v.capacity().max(16));
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let d = v.as_mut_ptr().add(v.len()) as *mut __m256i;
+            let s = &self.st[b] as *const DBlock as *const __m256i;
+            for q in 0..6 {
+                _mm256_stream_si256(d.add(q), _mm256_load_si256(s.add(q)));
+            }
+            v.set_len(v.len() + 1);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        v.push(self.st[b]);
+    }
+
+    #[inline(always)]
+    fn flush_pend(&mut self, links: &LinkTable, base: i64) {
+        for i in 0..self.pend.len() {
+            let p = self.pend[i];
+            let (person, ph) = links.person(p.user, p.uh);
+            let part = upart(ph);
+            let idx = self.sv_cnt[part];
+            self.sv_cnt[part] = idx + 1;
+            self.sc.push(&mut self.sv, part, Sv { k: key(ph, p.ts - base), person, price: p.price, cat: p.cat });
+            self.push_key(DKey { h: p.h, h2: p.h2, ingest: p.ingest, loc: (self.t << 56) | ((part as u64) << 32) | idx as u64 });
+        }
+        self.pend.clear();
+    }
+
+    /// Flush every staging buffer; call once after the last chunk.
+    fn finish(&mut self, links: &LinkTable, base: i64) {
+        self.flush_pend(links, base);
+        self.sc.finish(&mut self.sv);
+        for b in 0..DB {
+            let n = self.st_n[b] as usize;
+            if n > 0 {
+                let mut blk = self.st[b];
+                for k in &mut blk.0[n..] {
+                    *k = DKEY_PAD;
+                }
+                self.dk[b].push(blk);
+                self.st_n[b] = 0;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
+}
+
+fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
     let end = c.data.as_ptr_range().end;
     scan::<7>(c.data, |raw| {
         let [eid, user, ts, ingest, et, prod, price] = permute(raw, &c.map);
@@ -483,126 +638,82 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
         }
         let se = Small::new_in(eid, end);
         let h = se.h();
+        let h2 = se.h2();
         let ingest_ms = parse_ts(ingest);
-        let mut kind = 0u8;
-        let mut tsv = 0i64;
-        let mut pr = 0u32;
-        let mut cat = 0u16;
-        let mut usr = Small::new(b"");
-        if let (Some(ing), Some(t)) = (ingest_ms, parse_ts(ts)) {
-            if !user.is_empty() && t >= w.ws && t < w.we && !prod.is_empty() && ing - t <= LATE {
+        // ingest_ts is always valid F1 (whole seconds); a bad one loses every tie
+        let ing = match ingest_ms {
+            Some(v) => v.div_euclid(1000).clamp(0, u32::MAX as i64 - 2) as u32,
+            None => u32::MAX - 1,
+        };
+        if let (Some(ingv), Some(t)) = (ingest_ms, parse_ts(ts)) {
+            if !user.is_empty() && t >= w.ws && t < w.we && !prod.is_empty() && ingv - t <= LATE {
                 let k = event_kind(et);
+                let mut ok = k != 0;
+                let mut pr = 0u32;
+                let mut cat = 0u16;
                 if k == 3 {
-                    if let Some(p) = parse_price(price) {
-                        pr = p;
-                        cat = match prods.map.get(Small::new(prod)) {
-                            Some(i) => prods.cat_of[i as usize],
-                            None => prods.unknown,
-                        };
-                        kind = 3;
+                    match parse_price(price) {
+                        Some(p) => {
+                            pr = p;
+                            cat = match prods.map.get(Small::new(prod)) {
+                                Some(i) => prods.cat_of[i as usize],
+                                None => prods.unknown,
+                            };
+                        }
+                        None => ok = false,
                     }
-                } else {
-                    kind = k;
                 }
-                if kind != 0 {
-                    tsv = t;
-                    usr = Small::new_in(user, end);
+                if ok {
+                    let usr = Small::new_in(user, end);
+                    let uh = usr.h();
+                    links.prefetch(uh);
+                    acc.pend.push(Pend { uh, user: usr, ts: t, h, h2, ingest: ing, price: pr, cat });
+                    if acc.pend.len() == PEND_BATCH {
+                        acc.flush_pend(links, base);
+                    }
+                    return;
                 }
             }
         }
-        push_nt(&mut out[(h >> (64 - DB_BITS)) as usize], Ev {
-            h,
-            ingest: ingest_ms.unwrap_or(i64::MAX),
-            ts: tsv,
-            user: usr,
-            eid: se,
-            price: pr,
-            cat,
-            kind,
-            dead: 0,
-        });
+        acc.push_key(DKey { h, h2, ingest: ing, loc: LOC_INVALID });
     });
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_sfence();
-    }
 }
 
-/// Append one 64-byte record with non-temporal stores (no read-for-ownership of the line).
-#[inline(always)]
-fn push_nt(v: &mut Vec<Ev>, e: Ev) {
-    if v.len() == v.capacity() {
-        v.reserve(v.capacity().max(64));
-    }
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe {
-        use std::arch::x86_64::*;
-        let dst = v.as_mut_ptr().add(v.len()) as *mut __m256i;
-        let src = &e as *const Ev as *const __m256i;
-        _mm256_stream_si256(dst, _mm256_load_si256(src));
-        _mm256_stream_si256(dst.add(1), _mm256_load_si256(src.add(1)));
-        v.set_len(v.len() + 1);
-    }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-    v.push(e);
-}
-
-/// Dedup one bucket: per event_id keep the copy with the smallest ingest_ts,
-/// then emit valid survivors by user partition.
-fn dedup_bucket(mut parts: Vec<Vec<Ev>>, links: &LinkTable, base: i64) -> Vec<Vec<SvPair>> {
-    let total: usize = parts.iter().map(|p| p.len()).sum();
-    let mut table: HashTable<(u64, u32, u32)> = HashTable::with_capacity(total);
-    let ptrs: Vec<*mut Ev> = parts.iter_mut().map(|v| v.as_mut_ptr()).collect();
-    for (j, v) in parts.iter().enumerate() {
-        for i in 0..v.len() {
-            // SAFETY: indices are in bounds; e and cur are never the same record
-            let e = unsafe { &mut *ptrs[j].add(i) };
-            let h = e.h;
-            let th = h.rotate_left(32); // keys in a bucket share their top bits: move varying bits into the tag
-            let eid = e.eid;
-            let found = table
-                .find_mut(th, |&(hh, jj, ii)| hh == h && unsafe { (*ptrs[jj as usize].add(ii as usize)).eid } == eid);
-            match found {
-                Some(slot) => {
-                    let cur = unsafe { &mut *ptrs[slot.1 as usize].add(slot.2 as usize) };
-                    if e.ingest < cur.ingest {
-                        cur.dead = 1;
-                        *slot = (h, j as u32, i as u32);
-                    } else {
-                        e.dead = 1;
+/// Dedup one event_id bucket over its keys: per event keep the copy with the
+/// smallest ingest_ts (the first seen on a tie: equal ingest means identical
+/// copies). Returns the locations of the session records of losing copies.
+fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u64> {
+    let total: usize = blocks.iter().map(|v| v.len() * 8).sum();
+    let mut table: HashTable<DKey> = HashTable::with_capacity(total);
+    let mut kills = Vec::new();
+    for v in &blocks {
+        for blk in v {
+            for k in &blk.0 {
+                if k.loc == LOC_PAD {
+                    continue;
+                }
+                // keys in a bucket share their top bits: move varying bits into the tag
+                let th = k.h.rotate_left(32);
+                match table.find_mut(th, |e| e.h == k.h && e.h2 == k.h2) {
+                    Some(cur) => {
+                        if k.ingest < cur.ingest {
+                            if cur.loc != LOC_INVALID {
+                                kills.push(cur.loc);
+                            }
+                            cur.ingest = k.ingest;
+                            cur.loc = k.loc;
+                        } else if k.loc != LOC_INVALID {
+                            kills.push(k.loc);
+                        }
+                    }
+                    None => {
+                        table.insert_unique(th, *k, |e| e.h.rotate_left(32));
                     }
                 }
-                None => {
-                    table.insert_unique(th, (h, j as u32, i as u32), |x| x.0.rotate_left(32));
-                }
             }
         }
     }
-    drop(table);
-    const D: usize = 16; // prefetch distance
-    let cap = (total / PP + total / PP / 8) / 2 + 16;
-    let mut out: Vec<Vec<SvPair>> = (0..PP).map(|_| Vec::with_capacity(cap)).collect();
-    let mut sc = PairScatter::new(PP);
-    let mut live: Vec<(u64, u32)> = Vec::new();
-    for v in &parts {
-        live.clear();
-        for (i, e) in v.iter().enumerate() {
-            if e.dead == 0 && e.kind != 0 {
-                live.push((e.user.h(), i as u32));
-            }
-        }
-        for k in 0..live.len() {
-            if k + D < live.len() {
-                links.prefetch(live[k + D].0);
-            }
-            let (uh, i) = live[k];
-            let e = &v[i as usize];
-            let (person, ph) = links.person(e.user, uh);
-            sc.push(&mut out, upart(ph), Sv { k: key(ph, e.ts - base), person, price: if e.kind == 3 { e.price } else { 0 }, cat: e.cat });
-        }
-    }
-    sc.finish(&mut out);
-    out
+    kills
 }
 
 fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
@@ -770,12 +881,14 @@ fn starts_from_counts(cnt: &mut [u32]) -> usize {
 
 /// Concatenate the per-job event pairs, sorted by key.
 fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
+    // records with price PRICE_DEAD (killed by dedup) or PRICE_PAD (padding) are skipped
     let mut cnt = vec![0u32; NRB];
     for p in &parts {
         for pr in p {
-            cnt[rbucket(pr.0[0].k)] += 1;
-            if pr.0[1].price != u32::MAX {
-                cnt[rbucket(pr.0[1].k)] += 1;
+            for e in &pr.0 {
+                if e.price < PRICE_DEAD {
+                    cnt[rbucket(e.k)] += 1;
+                }
             }
         }
     }
@@ -785,16 +898,13 @@ fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
     let dst = out.as_mut_ptr();
     for p in &parts {
         for pr in p {
-            let a = pr.0[0];
-            let ba = rbucket(a.k);
-            // SAFETY: the counting pass sized every bucket; each slot is written once
-            unsafe { dst.add(cnt[ba] as usize).write(a) };
-            cnt[ba] += 1;
-            let b = pr.0[1];
-            if b.price != u32::MAX {
-                let bb = rbucket(b.k);
-                unsafe { dst.add(cnt[bb] as usize).write(b) };
-                cnt[bb] += 1;
+            for &e in &pr.0 {
+                if e.price < PRICE_DEAD {
+                    let b = rbucket(e.k);
+                    // SAFETY: the counting pass sized every bucket; each slot is written once
+                    unsafe { dst.add(cnt[b] as usize).write(e) };
+                    cnt[b] += 1;
+                }
             }
         }
     }
@@ -982,6 +1092,19 @@ fn per_thread<A: Send, C: Sync>(chunks: &[C], nthreads: usize, init: impl Fn() -
     slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
 }
 
+/// Like per_thread, but the accumulator is told its thread slot.
+fn per_thread_t<A: Send, C: Sync>(chunks: &[C], nthreads: usize, init: impl Fn(usize) -> A + Sync, f: impl Fn(&mut A, &C) + Sync) -> Vec<A> {
+    use std::sync::Mutex;
+    let slots: Vec<Mutex<Option<A>>> = (0..nthreads + 1).map(|_| Mutex::new(None)).collect();
+    chunks.par_iter().for_each(|c| {
+        let t = rayon::current_thread_index().unwrap_or(nthreads).min(nthreads);
+        let mut g = slots[t].lock().unwrap();
+        let acc = g.get_or_insert_with(|| init(t));
+        f(acc, c);
+    });
+    slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect()
+}
+
 /// Like per_thread, but consumes owned work items (so their memory is freed as they finish).
 fn per_thread_owned<A: Send, W: Send>(items: Vec<W>, nthreads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, W) + Sync) -> Vec<A> {
     use std::sync::Mutex;
@@ -1008,6 +1131,8 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>, nb: usize) -> Vec<Vec<Vec<T>>> {
 
 fn main() {
     let t0 = Instant::now();
+    let _ = T0.set(t0);
+    VERBOSE.store(std::env::var("SS_VERBOSE").is_ok(), std::sync::atomic::Ordering::Relaxed);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let log = |m: &str| {
         if verbose {
@@ -1039,46 +1164,78 @@ fn main() {
     let ck_chunks = make_chunks::<4>(&ck_files, &["click_id", "user_id", "campaign_id", "ts"]);
     log("mapped");
     let nthreads = rayon::current_num_threads().max(1);
+    assert!(nthreads < 255, "thread slot must fit 8 bits of a record location");
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.data.len()).sum();
     let ck_bytes: usize = ck_chunks.iter().map(|c| c.data.len()).sum();
-    // expected records per thread per bucket, with headroom
-    let ev_cap = ev_bytes / 70 / nthreads / DB + 64;
+    let base = w.ws - WEEK;
+    // expected records per thread per partition / bucket, with headroom
+    let est_events = ev_bytes / 70;
+    let sv_cap = est_events / nthreads / PP / 2 + 32;
+    let dk_cap = est_events / nthreads / DB / 8 + 8;
     let ck_cap = ck_bytes / 40 / nthreads / PP + 32;
 
-    // Phase 1: links (one thread) while all other threads parse events.
-    let ((links, nlink), ev_jobs) = rayon::join(
-        || build_links(&ln_files),
-        || {
-            per_thread(&ev_chunks, nthreads, || (0..DB).map(|_| Vec::with_capacity(ev_cap)).collect::<Vec<Vec<Ev>>>(), |out, c| {
-                parse_event_chunk(out, c, &w, &prods)
-            })
-        },
-    );
-    log(&format!("parsed events: {} chunks, {} link ids", ev_chunks.len(), nlink));
+    // Phase 1: links, on all threads.
+    let (links, nlink) = build_links(&ln_files);
+    log(&format!("links: {nlink} ids"));
 
-    // Phase 2: dedup events and parse clicks; both resolve persons and bucket by person.
-    let ev_buckets = transpose(ev_jobs, DB);
-    let (ev_pp, ck_jobs) = rayon::join(
-        || ev_buckets.into_par_iter().map(|b| dedup_bucket(b, &links, w.ws - WEEK)).collect::<Vec<Vec<Vec<SvPair>>>>(),
+    // Phase 2: events and clicks in one parallel pass; both resolve persons.
+    let (mut ev_accs, ck_jobs) = rayon::join(
+        || {
+            let r = per_thread_t(&ev_chunks, nthreads, |t| EvAcc::new(t, sv_cap, dk_cap), |acc, c| {
+                parse_event_chunk(acc, c, &w, &prods, &links, base)
+            });
+            vlog("events: all chunks parsed");
+            r
+        },
         || {
             per_thread(&ck_chunks, nthreads, || (0..PP).map(|_| Vec::with_capacity(ck_cap)).collect::<Vec<Vec<Ck>>>(), |out, c| {
                 parse_click_chunk(out, c, &w, &camps, &links)
             })
         },
     );
-    log("dedup + clicks");
+    ev_accs.par_iter_mut().for_each(|a| a.finish(&links, base));
+    log(&format!("parsed events + clicks: {} chunks", ev_chunks.len()));
 
-    // Phase 3: sessions.
+    // Phase 3: dedup over the keys; kills grouped by partition.
+    // thread slot -> position in ev_accs
+    let mut tpos = vec![usize::MAX; 256];
+    for (i, a) in ev_accs.iter().enumerate() {
+        tpos[a.t as usize] = i;
+    }
+    let mut sv_jobs: Vec<Vec<Vec<SvPair>>> = Vec::with_capacity(ev_accs.len());
+    let mut dk_jobs: Vec<Vec<Vec<DBlock>>> = Vec::with_capacity(ev_accs.len());
+    for a in ev_accs {
+        sv_jobs.push(a.sv);
+        dk_jobs.push(a.dk);
+    }
+    let dk_buckets = transpose(dk_jobs, DB);
+    let kills: Vec<Vec<u64>> = dk_buckets.into_par_iter().map(dedup_keys).collect();
+    let mut kills_pp: Vec<Vec<u64>> = (0..PP).map(|_| Vec::new()).collect();
+    for kv in &kills {
+        for &k in kv {
+            kills_pp[((k >> 32) & 0xFFFF) as usize].push(k);
+        }
+    }
+    drop(kills);
+    log(&format!("dedup: {} copies dropped", kills_pp.iter().map(|v| v.len()).sum::<usize>()));
+
+    // Phase 4: sessions.
     let ws_day = w.ws.div_euclid(DAY);
     let ndays = ((w.we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
-    let cx = Ctx { base: w.ws - WEEK, ncamp: camps.channel.len(), ndays, ws_day, ncat: prods.cats.len() };
-    let ev_by_pp = transpose(ev_pp, PP);
+    let cx = Ctx { base, ncamp: camps.channel.len(), ndays, ws_day, ncat: prods.cats.len() };
+    let ev_by_pp = transpose(sv_jobs, PP);
     let ck_by_pp = transpose(ck_jobs, PP);
+    let tpos = &tpos;
     let accs: Vec<Acc> = per_thread_owned(
-        ev_by_pp.into_iter().zip(ck_by_pp).collect(),
+        ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
         nthreads,
         || Acc::new(&cx),
-        |acc, (ev_parts, ck_parts): (Vec<Vec<SvPair>>, Vec<Vec<Ck>>)| {
+        |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvPair>>, Vec<Vec<Ck>>), Vec<u64>)| {
+            for k in kills {
+                let j = tpos[(k >> 56) as usize];
+                let idx = (k & 0xFFFF_FFFF) as usize;
+                ev_parts[j][idx / 2].0[idx % 2].price = PRICE_DEAD;
+            }
             let mut evs: Vec<Sv> = sorted_events(ev_parts);
             let mut cks: Vec<Ck> = sorted_clicks(ck_parts);
             process_partition(acc, &cx, &mut evs, &mut cks);

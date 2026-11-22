@@ -89,6 +89,18 @@ impl Small {
         self.b[15] == 0
     }
 
+    /// A second 32-bit hash, independent of `h`, so (h, h2) identifies an ID
+    /// with 96 bits. Long IDs read their bytes (call it while they are hot).
+    #[inline(always)]
+    pub fn h2(&self) -> u32 {
+        let (w0, w1) = self.words();
+        if Self::is_long(w1) {
+            (xxhash_rust::xxh3::xxh3_64_with_seed(self.as_bytes(), 0x2545_F491_4F6C_DD1D) >> 32) as u32
+        } else {
+            mum(w0 ^ 0x9E37_79B9_7F4A_7C15, w1 ^ 0xD6E8_FEB8_6659_FD93) as u32
+        }
+    }
+
     /// 64-bit hash of the ID's bytes; the same for every handle of equal bytes.
     #[inline(always)]
     pub fn h(&self) -> u64 {
