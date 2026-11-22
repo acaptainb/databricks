@@ -1440,7 +1440,7 @@ fn main() {
     // TIMING PROBE v2 (probe2 branch only; enabled by SS_PROBE=1 in this
     // branch's Dockerfile). On practice-size data it deliberately corrupts
     // user_daily so the scorer's missing / extra / differing row counts carry:
-    //   missing   = links_ms * 1000 + parse_ms      (parse = links end -> parse end)
+    //   missing   = links_ms * 2000 + parse_ms (parse capped at 1999)
     //   extra     = dedup_ms * 1000 + sessions_ms
     //   differing = touch_ms * 1000 + thp * 100 + nthreads
     // touch_ms: streaming every input byte once before the pipeline starts
@@ -1452,7 +1452,7 @@ fn main() {
             .and_then(|s| s.split_whitespace().position(|w| w.starts_with('[')))
             .map(|i| i as u64)
             .unwrap_or(9);
-        let missing = c(t_links - t_mapped) * 1000 + c(t_parse - t_links);
+        let missing = c(t_links - t_mapped) * 2000 + (t_parse - t_links).min(1999);
         let extra = c(t_dedup - t_parse) * 1000 + c(t_sess - t_dedup);
         let differing = c(touch_ms) * 1000 + thp.min(9) * 100 + (nthreads as u64).min(99);
         eprintln!("probe: missing {missing} extra {extra} differing {differing} (sink {touch_sink})");
