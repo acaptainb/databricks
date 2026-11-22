@@ -270,26 +270,33 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
     for i in 0..n {
         root[i] = find(&mut parent, i as u32);
     }
-    // name = byte-wise smallest ID of the component
+    // name = byte-wise smallest ID of the component (parallel atomic min)
     vlog("links: roots done");
-    let mut name: Vec<Option<Small>> = vec![None; n];
-    for (p, part) in parts.iter().enumerate() {
-        let b = pbase[p] as usize;
-        for (i, k) in part.keys.iter().enumerate() {
-            let r = root[b + i] as usize;
-            match &name[r] {
-                Some(cur) if cur.as_bytes() <= k.as_bytes() => {}
-                _ => name[r] = Some(*k),
+    use std::sync::atomic::{AtomicU32, Ordering as AO};
+    let all: Vec<Small> = parts.iter().flat_map(|p| p.keys.iter().copied()).collect();
+    let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
+    (0..n).into_par_iter().with_min_len(4096).for_each(|g| {
+        let r = root[g] as usize;
+        let kb = all[g].as_bytes();
+        let mut cur = best[r].load(AO::Relaxed);
+        loop {
+            if cur != u32::MAX && all[cur as usize].as_bytes() <= kb {
+                break;
+            }
+            match best[r].compare_exchange_weak(cur, g as u32, AO::Relaxed, AO::Relaxed) {
+                Ok(_) => break,
+                Err(c) => cur = c,
             }
         }
-    }
+    });
     parts.par_iter_mut().enumerate().for_each(|(p, part)| {
         let b = pbase[p] as usize;
         let m = part.keys.len();
-        part.name = (0..m).map(|i| name[root[b + i] as usize].unwrap()).collect();
+        part.name = (0..m).map(|i| all[best[root[b + i] as usize].load(AO::Relaxed) as usize]).collect();
     });
     drop(root);
-    drop(name);
+    drop(best);
+    drop(all);
     vlog("links: names done");
     let t = LinkTable::build(&parts, n);
     vlog("links: table built");
@@ -307,56 +314,65 @@ struct LSlot {
 
 pub struct LinkTable {
     slots: &'static [LSlot],
-    mask: usize,
+    sub_bits: u32,
+    sub_mask: usize,
 }
 
+/// The table is PP independent open-addressing sub-tables, one per ID hash
+/// partition (the same partitions build_links interns into), so every
+/// sub-table is built in parallel. A lookup is still one cache line.
 impl LinkTable {
-    fn build(parts: &[IdPart], n: usize) -> LinkTable {
-        let cap = (n * 2).next_power_of_two().max(64);
+    fn build(parts: &[IdPart], _n: usize) -> LinkTable {
+        let maxk = parts.iter().map(|p| p.keys.len()).max().unwrap_or(0);
+        let sub = (maxk * 2).next_power_of_two().max(64);
+        let cap = sub * PP;
         let bytes = cap * std::mem::size_of::<LSlot>();
         let m = memmap2::MmapMut::map_anon(bytes).expect("anon map");
         let _ = m.advise(memmap2::Advice::HugePage);
         let m: &'static mut memmap2::MmapMut = Box::leak(Box::new(m));
         // SAFETY: zeroed memory is a valid array of empty slots (key length 0)
         let slots: &'static mut [LSlot] = unsafe { std::slice::from_raw_parts_mut(m.as_mut_ptr() as *mut LSlot, cap) };
-        let mask = cap - 1;
-        for part in parts {
+        let sub_mask = sub - 1;
+        slots.par_chunks_mut(sub).zip(parts.par_iter()).for_each(|(st, part)| {
             for i in 0..part.keys.len() {
-                let h = part.hashes[i];
-                let mut idx = (h as usize) & mask;
-                while !slots[idx].key.is_empty() {
-                    idx = (idx + 1) & mask;
+                let mut idx = (part.hashes[i] as usize) & sub_mask;
+                while !st[idx].key.is_empty() {
+                    idx = (idx + 1) & sub_mask;
                 }
-                slots[idx] = LSlot { key: part.keys[i], name: part.name[i] };
+                st[idx] = LSlot { key: part.keys[i], name: part.name[i] };
             }
-        }
-        LinkTable { slots, mask }
+        });
+        LinkTable { slots, sub_bits: sub.trailing_zeros(), sub_mask }
+    }
+    #[inline(always)]
+    fn slot_of(&self, h: u64) -> usize {
+        (upart(h) << self.sub_bits) | ((h as usize) & self.sub_mask)
     }
     #[inline(always)]
     fn prefetch(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            _mm_prefetch(self.slots.as_ptr().add((h as usize) & self.mask) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.slots.as_ptr().add(self.slot_of(h)) as *const i8, _MM_HINT_T0);
         }
     }
     /// Person (name, name hash) of a user ID; an unlinked ID is its own person.
     #[inline(always)]
     fn person(&self, user: Small, h: u64) -> (Small, u64) {
-        let mut idx = (h as usize) & self.mask;
+        let base = upart(h) << self.sub_bits;
+        let mut idx = (h as usize) & self.sub_mask;
         loop {
-            let s = &self.slots[idx];
+            let s = &self.slots[base + idx];
             if s.key.is_empty() {
                 return (user, h);
             }
             if s.key == user {
                 return (s.name, s.name.h());
             }
-            idx = (idx + 1) & self.mask;
+            idx = (idx + 1) & self.sub_mask;
         }
     }
 }
-
 // ---------------------------------------------------------------- records
 
 #[derive(Clone, Copy)]
