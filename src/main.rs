@@ -33,7 +33,7 @@ const WEEK: i64 = 7 * DAY;
 const LATE: i64 = DAY;
 pub const MAX_PRICE: u64 = 10_000_000;
 
-const DB_BITS: u32 = 10; // dedup buckets, by event_id hash (top bits)
+const DB_BITS: u32 = 11; // dedup buckets, by event_id hash (top bits)
 const DB: usize = 1 << DB_BITS;
 const PP_BITS: u32 = 8; // user / person partitions (bits 40..)
 const PP: usize = 1 << PP_BITS;
