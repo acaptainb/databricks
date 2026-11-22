@@ -344,7 +344,7 @@ struct Ev { // exactly one cache line
     ingest: i64,
     ts: i64,
     user: Small,
-    eid: S,
+    eid: Small,
     price: u32,
     cat: u16,
     kind: u8, // 0 invalid, 1 view, 2 cart, 3 purchase
@@ -456,7 +456,8 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
         if eid.is_empty() {
             return;
         }
-        let h = hb(eid);
+        let se = Small::new(eid);
+        let h = se.h();
         let ingest_ms = parse_ts(ingest);
         let mut kind = 0u8;
         let mut tsv = 0i64;
@@ -494,7 +495,7 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
             ingest: ingest_ms.unwrap_or(i64::MAX),
             ts: tsv,
             user: usr,
-            eid,
+            eid: se,
             price: pr,
             cat,
             kind,
