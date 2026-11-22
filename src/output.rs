@@ -128,6 +128,14 @@ fn col_i64(name: &'static str, vals: impl Iterator<Item = i64>, n: usize) -> Col
     Col { name, ty: T_INT64, rep: REQUIRED, conv: None, body }
 }
 
+fn col_i32(name: &'static str, vals: impl Iterator<Item = i32>, n: usize) -> Col {
+    let mut body = Vec::with_capacity(n * 4);
+    for v in vals {
+        body.extend_from_slice(&v.to_le_bytes());
+    }
+    Col { name, ty: T_INT32, rep: REQUIRED, conv: None, body }
+}
+
 fn col_date(name: &'static str, vals: impl Iterator<Item = i32>, n: usize) -> Col {
     let mut body = Vec::with_capacity(n * 4);
     for v in vals {
@@ -255,8 +263,8 @@ pub fn write_user(path: &Path, rows: &[UserRow], cats: &[S]) {
     let cols = vec![
         col_str("user_id", rows.iter().map(|r| r.name.as_bytes()), name_bytes),
         col_date("day", rows.iter().map(|r| r.day), n),
-        col_i64("sessions", rows.iter().map(|r| r.sessions as i64), n),
-        col_i64("events", rows.iter().map(|r| r.events as i64), n),
+        col_i32("sessions", rows.iter().map(|r| r.sessions as i32), n),
+        col_i32("events", rows.iter().map(|r| r.events as i32), n),
         col_i64("revenue_cents", rows.iter().map(|r| r.revenue as i64), n),
         col_opt_str("top_category", rows.iter().map(|r| if r.top >= 0 { Some(cats[r.top as usize]) } else { None }), n),
     ];

@@ -584,3 +584,172 @@ pub fn old_parse_dt(b: &[u8]) -> Option<i64> {
         eprintln!("valid {n}");
     }
 }
+
+// ---------------------------------------------------------------- date table
+//
+// Every timestamp worth parsing falls within a few weeks of the window, so the
+// valid `YYYY-MM-DD` strings of that range are precomputed: a date is one table
+// probe instead of decoding and validating year, month and day. Anything not
+// in the table goes through the full parser, so results are identical.
+
+#[derive(Clone, Copy, Default)]
+struct DSlot {
+    a: u64, // bytes 0..8: "YYYY-MM-"
+    d: u16, // bytes 8..10: "DD"
+    used: bool,
+    days: i64,
+}
+
+pub struct DateTable {
+    slots: Vec<DSlot>,
+}
+
+const DT_BITS: u32 = 10;
+
+/// (year, month, day) of a day count since 1970-01-01 (proleptic Gregorian).
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (y + (m <= 2) as i64, m, d)
+}
+
+impl DateTable {
+    #[inline(always)]
+    fn idx(a: u64, d: u16) -> usize {
+        ((a ^ ((d as u64) << 23)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - DT_BITS)) as usize
+    }
+
+    /// Every date of days [lo, hi] (since 1970-01-01) with a four-digit year.
+    pub fn new(lo: i64, hi: i64) -> DateTable {
+        let mut slots = vec![DSlot::default(); 1 << DT_BITS];
+        let mut n = 0usize;
+        for z in lo..=hi {
+            let (y, m, d) = civil_from_days(z);
+            if !(0..=9999).contains(&y) || n >= (1 << DT_BITS) / 2 {
+                continue;
+            }
+            let s = format!("{y:04}-{m:02}-{d:02}");
+            let b = s.as_bytes();
+            let a = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let dd = u16::from_le_bytes(b[8..10].try_into().unwrap());
+            let mut i = Self::idx(a, dd);
+            while slots[i].used {
+                i = (i + 1) & ((1 << DT_BITS) - 1);
+            }
+            slots[i] = DSlot { a, d: dd, used: true, days: z };
+            n += 1;
+        }
+        DateTable { slots }
+    }
+
+    /// Day count of the `YYYY-MM-DD` in b[0..10], if it is in the table.
+    #[inline(always)]
+    fn lookup(&self, b: &[u8]) -> Option<i64> {
+        let a = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let dd = u16::from_le_bytes(b[8..10].try_into().unwrap());
+        let mut i = Self::idx(a, dd);
+        loop {
+            let s = &self.slots[i];
+            if !s.used {
+                return None;
+            }
+            if s.a == a && s.d == dd {
+                return Some(s.days);
+            }
+            i = (i + 1) & ((1 << DT_BITS) - 1);
+        }
+    }
+}
+
+/// `HH:MM:SS` (8 bytes) to seconds since midnight; None unless the digits,
+/// both colons and every range are valid. One add checks everything; one
+/// multiply forms the three numbers.
+#[inline(always)]
+fn tod_seconds(p: &[u8]) -> Option<i64> {
+    let w = u64::from_le_bytes(p[0..8].try_into().unwrap()) ^ 0x3030_3A30_303A_3030;
+    if ((w.wrapping_add(0x060A_0F06_0A0F_060D)) | w) & 0xF0F0_F0F0_F0F0_F0F0 != 0 {
+        return None;
+    }
+    let t = w.wrapping_mul(2561);
+    let h = (t >> 8) & 0xFF;
+    let m = (t >> 32) & 0xFF;
+    let s = t >> 56;
+    if h > 23 {
+        return None;
+    }
+    Some((h * 3600 + m * 60 + s) as i64)
+}
+
+/// Same result as `parse_ts` for every input; F1 and F2 timestamps whose date
+/// is in `dt` take the fast path.
+#[inline(always)]
+pub fn parse_ts_fast(b: &[u8], dt: &DateTable) -> Option<i64> {
+    let n = b.len();
+    if ((n == 20 && b[19] == b'Z') || (n == 25 && (b[19] == b'+' || b[19] == b'-'))) && b[10] == b'T' {
+        if let Some(day) = dt.lookup(b) {
+            let base = day * 86_400_000 + tod_seconds(&b[11..19])? * 1000;
+            if n == 20 {
+                return Some(base);
+            }
+            if b[22] != b':' {
+                return None;
+            }
+            let oh = d2(b, 20)?;
+            let om = d2(b, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh as i64 * 60 + om as i64) * 60_000;
+            return Some(if b[19] == b'+' { base - off } else { base + off });
+        }
+    }
+    parse_ts(b)
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+    #[test]
+    fn civil_round_trip() {
+        for z in -800_000..3_000_000i64 {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+        }
+    }
+    #[test]
+    fn fast_matches_parse_ts() {
+        let base = days_from_civil(2026, 10, 1);
+        let dt = DateTable::new(base - 60, base + 74);
+        let mut x: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet: &[u8] = b"0123456789-T:Z+zt .\x7f";
+        for _ in 0..3_000_000 {
+            let z = base - 70 + (next() % 160) as i64;
+            let (y, mo, d) = civil_from_days(z);
+            let (h, mi, s) = (next() % 26, next() % 62, next() % 62);
+            let mut t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}").into_bytes();
+            match next() % 3 {
+                0 => t.push(b'Z'),
+                1 => t.extend_from_slice(format!("{}{:02}:{:02}", if next() % 2 == 0 { '+' } else { '-' }, next() % 26, next() % 62).as_bytes()),
+                _ => {}
+            }
+            for _ in 0..(next() % 3) {
+                let i = (next() as usize) % t.len();
+                t[i] = alphabet[(next() as usize) % alphabet.len()];
+            }
+            assert_eq!(parse_ts_fast(&t, &dt), parse_ts(&t), "{:?}", String::from_utf8_lossy(&t));
+        }
+    }
+}

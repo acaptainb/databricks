@@ -551,6 +551,7 @@ struct CkRaw {
 struct Win {
     ws: i64,
     we: i64,
+    dates: DateTable, // valid dates around the window, for fast timestamp parsing
 }
 
 // ---------------------------------------------------------------- events
@@ -771,13 +772,13 @@ fn parse_event_chunk_impl<const IDENT: bool>(acc: &mut EvAcc, c: &Chunk, w: &Win
         let h = se.h();
         let bucket = (h >> (64 - DB_BITS)) as u32;
         let hx = dkey_hx(h, se.h2());
-        let ingest_ms = parse_ts(ingest);
+        let ingest_ms = parse_ts_fast(ingest, &w.dates);
         // ingest_ts is always valid F1 (whole seconds); a bad one loses every tie
         let ing = match ingest_ms {
             Some(v) => v.div_euclid(1000).clamp(0, u32::MAX as i64 - 2) as u32,
             None => u32::MAX - 1,
         };
-        if let (Some(ingv), Some(t)) = (ingest_ms, parse_ts(ts)) {
+        if let (Some(ingv), Some(t)) = (ingest_ms, parse_ts_fast(ts, &w.dates)) {
             if !user.is_empty() && t >= w.ws && t < w.we && !prod.is_empty() && ingv - t <= LATE {
                 let k = event_kind(et);
                 let mut ok = k != 0;
@@ -871,7 +872,7 @@ fn parse_click_chunk_impl<const IDENT: bool>(out: &mut [Vec<Ck>], c: &Chunk, w: 
         if cid.is_empty() || user.is_empty() {
             return;
         }
-        let Some(t) = parse_ts(ts) else { return };
+        let Some(t) = parse_ts_fast(ts, &w.dates) else { return };
         if t < lo || t >= w.we {
             return;
         }
@@ -1264,7 +1265,10 @@ fn read_manifest(p: &Path) -> Win {
         let q2 = rest[q1..].find('"').unwrap() + q1;
         parse_ts(rest[q1..q2].as_bytes()).unwrap_or_else(|| panic!("bad {key}"))
     };
-    Win { ws: get("window_start"), we: get("window_end") }
+    let (ws, we) = (get("window_start"), get("window_end"));
+    // ts is checked against [ws - 7 days, we) and ingest_ts runs past it: 60 days of slack
+    let dates = DateTable::new(ws.div_euclid(DAY) - 60, (we - 1).div_euclid(DAY) + 60);
+    Win { ws, we, dates }
 }
 
 /// Run `f` over all chunks in parallel with exactly one accumulator per pool thread.
