@@ -181,6 +181,14 @@ impl IdPart {
     }
 }
 
+
+#[inline(always)]
+fn prefetch_read(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+}
 #[allow(dead_code)]
 fn find(p: &mut [u32], mut x: u32) -> u32 {
     while p[x as usize] != x {
@@ -222,12 +230,15 @@ unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
 fn build_links(files: &[S]) -> (LinkTable, usize) {
+    vlog("links: start");
     let chunks = make_chunks_sized::<2>(files, &["user_id_a", "user_id_b"], 1 << 19);
     // parse, and scatter each side by hash partition: (id, hash, slot = pair*2+side)
     let parsed: Vec<(usize, Vec<Vec<(Small, u64, u32, NRef)>>)> = chunks
         .par_iter()
         .map(|c| {
-            let mut v: Vec<Vec<(Small, u64, u32, NRef)>> = (0..PP).map(|_| Vec::new()).collect();
+            // sized for this chunk (about 2 sides per 26-byte line, spread over PP partitions)
+            let cap = c.data.len() / 13 / PP + 16;
+            let mut v: Vec<Vec<(Small, u64, u32, NRef)>> = (0..PP).map(|_| Vec::with_capacity(cap)).collect();
             let mut n = 0u32;
             scan::<2>(c.data, |raw| {
                 let [a, b] = permute(raw, &c.map);
@@ -244,6 +255,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             (n as usize, v)
         })
         .collect();
+    vlog(&format!("links: parsed {} chunks", parsed.len()));
     let mut chunk_base = Vec::with_capacity(parsed.len());
     let mut npairs = 0usize;
     for (n, _) in &parsed {
@@ -269,7 +281,9 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             part
         })
         .collect();
+    vlog("links: interned");
     drop(parsed);
+    vlog("links: parsed buffers freed");
     let mut pbase = vec![0u32; PP + 1];
     for p in 0..PP {
         pbase[p + 1] = pbase[p] + parts[p].keys.len() as u32;
@@ -321,11 +335,15 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
     let all: Vec<Small> = parts.iter().flat_map(|p| p.keys.iter().copied()).collect();
     let best: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
     (0..n).into_par_iter().with_min_len(4096).for_each(|g| {
+        if g + 16 < n {
+            // the component slot a few keys ahead: its miss overlaps this key's work
+            prefetch_read(best.as_ptr().wrapping_add(root[g + 16] as usize) as *const u8);
+        }
         let r = root[g] as usize;
-        let kb = all[g].as_bytes();
+        let kg = &all[g];
         let mut cur = best[r].load(AO::Relaxed);
         loop {
-            if cur != u32::MAX && all[cur as usize].as_bytes() <= kb {
+            if cur != u32::MAX && all[cur as usize].bytes_le(kg) {
                 break;
             }
             match best[r].compare_exchange_weak(cur, g as u32, AO::Relaxed, AO::Relaxed) {
@@ -1364,12 +1382,11 @@ fn main() {
 
     let w = read_manifest(&data.join("manifest.json"));
     assert!(w.we - (w.ws - WEEK) < (1i64 << TS_BITS), "window too long for 40-bit relative times");
-    let prods = load_products(map_file(&data.join("products.csv")));
-    let camps = load_campaigns(map_file(&data.join("campaigns.csv")));
-
-    let ev_files = list_csv(&data.join("events"));
-    let ck_files = list_csv(&data.join("clicks"));
-    let ln_files = list_csv(&data.join("links"));
+    // products and campaigns load while the input files are being mapped
+    let ((prods, camps), (ev_files, (ck_files, ln_files))) = rayon::join(
+        || (load_products(map_file(&data.join("products.csv"))), load_campaigns(map_file(&data.join("campaigns.csv")))),
+        || (list_csv(&data.join("events")), (list_csv(&data.join("clicks")), list_csv(&data.join("links")))),
+    );
     let ev_chunks = make_chunks::<7>(
         &ev_files,
         &["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"],

@@ -112,6 +112,28 @@ impl Small {
         }
     }
 
+    /// `self.as_bytes() <= o.as_bytes()` (byte-wise), without a memcmp call
+    /// when both IDs are short: the inline bytes are zero-padded, so two
+    /// big-endian word compares and then the lengths give the exact order.
+    #[inline(always)]
+    pub fn bytes_le(&self, o: &Small) -> bool {
+        let (a0, a1) = self.words();
+        let (b0, b1) = o.words();
+        if !Self::is_long(a1) && !Self::is_long(b1) {
+            let (x0, y0) = (a0.swap_bytes(), b0.swap_bytes());
+            if x0 != y0 {
+                return x0 < y0;
+            }
+            const M: u64 = 0x00FF_FFFF_FFFF_FFFF; // bytes 8..15 without the length byte
+            let (x1, y1) = ((a1 & M).swap_bytes(), (b1 & M).swap_bytes());
+            if x1 != y1 {
+                return x1 < y1;
+            }
+            return (a1 >> 56) <= (b1 >> 56);
+        }
+        self.as_bytes() <= o.as_bytes()
+    }
+
     /// Identity key: equal for equal IDs, a consistent total order otherwise.
     #[inline(always)]
     fn okey(&self) -> (u64, u64) {
@@ -176,6 +198,14 @@ mod tests {
         assert_eq!(x.as_bytes(), b"abcdefghijklmno");
         assert_eq!(y.as_bytes(), b"abcdefghijklmnop");
         assert!(x != y);
+        // bytes_le matches slice order for every pair of short and long strings
+        let words = ["", "a", "ab", "a\0", "a\0b", "b", "abcdefghijklmno", "abcdefghijklmnp", "abcdefghijklmnop", "U1", "u1", "u10", "u2", "zz", "\u{ff}"];
+        for p in &words {
+            for q in &words {
+                let (sp, sq) = (Small::new(leak(p)), Small::new(leak(q)));
+                assert_eq!(sp.bytes_le(&sq), p.as_bytes() <= q.as_bytes(), "{p:?} <= {q:?}");
+            }
+        }
         // new_in matches new for every length, inside and at the edge of a buffer
         let buf = leak("abcdefghijklmnopqrstuvwxyz0123456789,\"x\",tail");
         let end = buf.as_ptr_range().end;
