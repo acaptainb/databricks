@@ -18,6 +18,9 @@ on:
       seed:
         description: Generator seed
         default: "7"
+      perf:
+        description: Also record a perf profile of the candidate
+        default: "false"
 
 jobs:
   bench:
