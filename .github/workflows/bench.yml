@@ -192,3 +192,7 @@ jobs:
               echo "=== docker $img run $i: $(echo "$e - $s" | bc) s"
             done
           done
+          sudo rm -rf out-d; IMAGE=ss:cand CPUS=4 MEM=14g cur/scripts/docker_run.sh data out-d
+          sudo chmod -R a+rwX out-d
+          echo "=== candidate image output vs reference binary output"
+          python3 cur/scripts/compare.py out-d out-ref
