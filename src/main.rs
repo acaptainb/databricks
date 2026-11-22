@@ -181,6 +181,7 @@ impl IdPart {
     }
 }
 
+#[allow(dead_code)]
 fn find(p: &mut [u32], mut x: u32) -> u32 {
     while p[x as usize] != x {
         let g = p[p[x as usize] as usize];
@@ -275,27 +276,45 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
     }
     let n = pbase[PP] as usize;
     vlog(&format!("links: parsed + interned {n} ids, {npairs} pairs"));
-    let mut parent: Vec<u32> = (0..n as u32).collect();
-    for k in 0..npairs {
+    // Lock-free parallel union-find. A root is only ever linked under a smaller
+    // root (CAS on the root's own slot), so every component's final root is its
+    // smallest index, exactly as in the serial version.
+    use std::sync::atomic::Ordering as UO;
+    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
+    let findc = |mut x: u32| -> u32 {
+        loop {
+            let px = parent[x as usize].load(UO::Relaxed);
+            if px == x {
+                return x;
+            }
+            let gp = parent[px as usize].load(UO::Relaxed);
+            if gp != px {
+                // path halving: gp is an ancestor of x
+                let _ = parent[x as usize].compare_exchange_weak(px, gp, UO::Relaxed, UO::Relaxed);
+            }
+            x = gp;
+        }
+    };
+    (0..npairs).into_par_iter().with_min_len(4096).for_each(|k| {
         let (x, y) = (local[2 * k], local[2 * k + 1]);
         let a = pbase[(x >> 24) as usize] + (x & 0xFF_FFFF);
         let b = pbase[(y >> 24) as usize] + (y & 0xFF_FFFF);
-        let ra = find(&mut parent, a);
-        let rb = find(&mut parent, b);
-        if ra != rb {
-            if ra < rb {
-                parent[rb as usize] = ra;
-            } else {
-                parent[ra as usize] = rb;
+        loop {
+            let ra = findc(a);
+            let rb = findc(b);
+            if ra == rb {
+                break;
+            }
+            let (hi, lo) = if ra < rb { (rb, ra) } else { (ra, rb) };
+            if parent[hi as usize].compare_exchange(hi, lo, UO::AcqRel, UO::Relaxed).is_ok() {
+                break;
             }
         }
-    }
+    });
     drop(local);
     vlog("links: union-find done");
-    let mut root = vec![0u32; n];
-    for i in 0..n {
-        root[i] = find(&mut parent, i as u32);
-    }
+    let root: Vec<u32> = (0..n as u32).into_par_iter().with_min_len(4096).map(|i| findc(i)).collect();
+    drop(parent);
     // name = byte-wise smallest ID of the component (parallel atomic min)
     vlog("links: roots done");
     use std::sync::atomic::{AtomicU32, Ordering as AO};
