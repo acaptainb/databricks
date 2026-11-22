@@ -62,8 +62,7 @@ impl Tw {
         self.varint(((v << 1) ^ (v >> 63)) as u64);
     }
     fn field(&mut self, id: i16, ty: u8) {
-        let last = self.last.last_mut().unwrap();
-        let d = id - *last;
+        let d = id - *self.last.last().unwrap();
         if (1..=15).contains(&d) {
             self.b.push(((d as u8) << 4) | ty);
         } else {
@@ -71,7 +70,7 @@ impl Tw {
             let v = id as i64;
             self.varint(((v << 1) ^ (v >> 63)) as u64);
         }
-        *last = id;
+        *self.last.last_mut().unwrap() = id;
     }
     fn i32f(&mut self, id: i16, v: i32) {
         self.field(id, TC_I32);
