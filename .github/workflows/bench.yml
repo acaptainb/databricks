@@ -124,6 +124,9 @@ jobs:
           perf report -i perf.data --no-children --sort srcline --stdio -g none --symbols='shopping_sessions::parse_event_chunk::{closure#0}' 2>/dev/null | grep -v '^#' | grep '%' | head -45
           echo "===== memmove callers"
           perf report -i perf.data --no-children --stdio -G --symbols=__memmove_avx512_unaligned_erms,__memmove_avx_unaligned_erms 2>/dev/null | grep -v '^#' | grep -E '[0-9]+\.[0-9]+%' | head -30
+          echo "===== hottest instructions of the event loop"
+          SYM=$(perf report -i perf.data --no-children --sort sym --stdio -g none 2>/dev/null | grep -o 'shopping_sessions::parse_event_chunk_impl::<true>::{closure#0}' | head -1)
+          perf annotate -i perf.data --stdio -l --symbol="$SYM" 2>/dev/null | grep -E '^ +[0-9]+\.[0-9]+' | sort -rn | head -60
 
       - name: Thread scaling and container overhead
         if: ${{ inputs.scaling == 'true' }}
