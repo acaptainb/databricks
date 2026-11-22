@@ -125,7 +125,7 @@ jobs:
             echo "=== cand NCPU=$t"; rm -rf out-s; mkdir out-s
             DATA_DIR=data OUTPUT_DIR=out-s NCPU=$t SS_VERBOSE=1 /usr/bin/time -f "  wall %e s  user %U  sys %S" ./cand
           done
-          cd cur && docker build -q -t ss:cand . >/dev/null && cd ..
+          cd cur && docker build -q -t shopping-sessions:latest . >/dev/null && cd ..
           for i in 1 2 3; do
             echo "=== docker run on fixture A1 (start-up cost)"; rm -rf out-d
             /usr/bin/time -f "  wall %e s" env CPUS=4 MEM=14g cur/scripts/docker_run.sh cur/fixtures/A1/input out-d
