@@ -126,13 +126,17 @@ pub fn header_map<const N: usize>(header: S, names: &[&str; N]) -> [u8; 8] {
 }
 
 pub fn make_chunks<const N: usize>(files: &[S], names: &[&str; N]) -> Vec<Chunk> {
+    make_chunks_sized::<N>(files, names, CHUNK)
+}
+
+pub fn make_chunks_sized<const N: usize>(files: &[S], names: &[&str; N], chunk: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     for &f in files {
         let Some(nl) = memchr::memchr(b'\n', f) else { continue };
         let map = header_map::<N>(&f[..nl], names);
         let mut pos = nl + 1;
         while pos < f.len() {
-            let mut end = (pos + CHUNK).min(f.len());
+            let mut end = (pos + chunk).min(f.len());
             if end < f.len() {
                 end = match memchr::memchr(b'\n', &f[end..]) {
                     Some(p) => end + p + 1,
