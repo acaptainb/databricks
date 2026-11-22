@@ -551,7 +551,9 @@ struct EvAcc {
     dk: Vec<Vec<DBlock>>, // [dedup bucket]
     st: Vec<DBlock>,
     st_n: Vec<u8>,
-    pend: Vec<Pend>,
+    ring: [Pend; PEND_BATCH], // prefetched lookups in flight, oldest at rh
+    rh: usize,
+    rn: usize,
 }
 
 impl EvAcc {
@@ -564,7 +566,9 @@ impl EvAcc {
             dk: (0..DB).map(|_| Vec::with_capacity(dk_cap)).collect(),
             st: vec![DBlock([DKEY_PAD; 8]); DB],
             st_n: vec![0; DB],
-            pend: Vec::with_capacity(PEND_BATCH),
+            ring: [Pend { uh: 0, user: Small::EMPTY, ts: 0, h: 0, h2: 0, ingest: 0, price: 0, cat: 0 }; PEND_BATCH],
+            rh: 0,
+            rn: 0,
         }
     }
 
@@ -596,18 +600,38 @@ impl EvAcc {
         v.push(self.st[b]);
     }
 
+    /// Resolve one valid copy's person and write its session record and key.
     #[inline(always)]
-    fn flush_pend(&mut self, links: &LinkTable, base: i64) {
-        for i in 0..self.pend.len() {
-            let p = self.pend[i];
-            let (person, ph) = links.person(p.user, p.uh);
-            let part = upart(ph);
-            let idx = self.sv_cnt[part];
-            self.sv_cnt[part] = idx + 1;
-            self.sc.push(&mut self.sv, part, Sv { k: key(ph, p.ts - base), person, price: p.price, cat: p.cat });
-            self.push_key(DKey { h: p.h, h2: p.h2, ingest: p.ingest, loc: (self.t << 56) | ((part as u64) << 32) | idx as u64 });
+    fn emit(&mut self, p: Pend, links: &LinkTable, base: i64) {
+        let (person, ph) = links.person(p.user, p.uh);
+        let part = upart(ph);
+        let idx = self.sv_cnt[part];
+        self.sv_cnt[part] = idx + 1;
+        self.sc.push(&mut self.sv, part, Sv { k: key(ph, p.ts - base), person, price: p.price, cat: p.cat });
+        self.push_key(DKey { h: p.h, h2: p.h2, ingest: p.ingest, loc: (self.t << 56) | ((part as u64) << 32) | idx as u64 });
+    }
+
+    /// Queue a valid copy whose lookup was just prefetched; resolve the copy
+    /// queued PEND_BATCH copies ago (its line has had time to arrive).
+    #[inline(always)]
+    fn push_pend(&mut self, p: Pend, links: &LinkTable, base: i64) {
+        if self.rn == PEND_BATCH {
+            let q = self.ring[self.rh];
+            self.rh = (self.rh + 1) % PEND_BATCH;
+            self.rn -= 1;
+            self.emit(q, links, base);
         }
-        self.pend.clear();
+        self.ring[(self.rh + self.rn) % PEND_BATCH] = p;
+        self.rn += 1;
+    }
+
+    fn flush_pend(&mut self, links: &LinkTable, base: i64) {
+        while self.rn > 0 {
+            let q = self.ring[self.rh];
+            self.rh = (self.rh + 1) % PEND_BATCH;
+            self.rn -= 1;
+            self.emit(q, links, base);
+        }
     }
 
     /// Flush every staging buffer; call once after the last chunk.
@@ -670,10 +694,7 @@ fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, link
                     let usr = Small::new_in(user, end);
                     let uh = usr.h();
                     links.prefetch(uh);
-                    acc.pend.push(Pend { uh, user: usr, ts: t, h, h2, ingest: ing, price: pr, cat });
-                    if acc.pend.len() == PEND_BATCH {
-                        acc.flush_pend(links, base);
-                    }
+                    acc.push_pend(Pend { uh, user: usr, ts: t, h, h2, ingest: ing, price: pr, cat }, links, base);
                     return;
                 }
             }
@@ -882,6 +903,56 @@ fn starts_from_counts(cnt: &mut [u32]) -> usize {
     s as usize
 }
 
+/// Sort a large bucket by key. Every key in a bucket shares its top RB bits, so
+/// an LSD radix sort over the low 64 - RB bits (14 per pass, skipping passes
+/// where all keys share the digit, as for one whale person's hash bits) gives
+/// the full key order.
+fn sort_big_sv(v: &mut [Sv]) {
+    let n = v.len();
+    if n < 4096 {
+        v.sort_unstable_by_key(|x| x.k);
+        return;
+    }
+    const D: u32 = 14;
+    const ND: usize = 1 << D;
+    let mut tmp: Vec<Sv> = Vec::with_capacity(n);
+    // SAFETY: every slot of tmp is written by a scatter pass before it is read
+    unsafe { tmp.set_len(n) };
+    let mut src: *mut Sv = v.as_mut_ptr();
+    let mut dst: *mut Sv = tmp.as_mut_ptr();
+    let mut cnt = vec![0usize; ND];
+    let mut shift = 0u32;
+    while shift < 64 - RB {
+        cnt.iter_mut().for_each(|c| *c = 0);
+        for i in 0..n {
+            let k = unsafe { (*src.add(i)).k };
+            cnt[((k >> shift) as usize) & (ND - 1)] += 1;
+        }
+        if cnt.iter().any(|&c| c == n) {
+            shift += D;
+            continue;
+        }
+        let mut s = 0usize;
+        for c in cnt.iter_mut() {
+            let x = *c;
+            *c = s;
+            s += x;
+        }
+        for i in 0..n {
+            let e = unsafe { *src.add(i) };
+            let d = ((e.k >> shift) as usize) & (ND - 1);
+            unsafe { dst.add(cnt[d]).write(e) };
+            cnt[d] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        shift += D;
+    }
+    if src != v.as_mut_ptr() {
+        // SAFETY: src is tmp, fully written by the last pass
+        unsafe { std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n) };
+    }
+}
+
 /// Concatenate the per-job event pairs, sorted by key.
 fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
     // records with price PRICE_DEAD (killed by dedup) or PRICE_PAD (padding) are skipped
@@ -915,7 +986,7 @@ fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
     unsafe { out.set_len(n) };
     for b in 0..NRB {
         let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
-        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, |s| s.sort_unstable_by_key(|x| x.k));
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, sort_big_sv);
     }
     out
 }

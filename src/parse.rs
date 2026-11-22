@@ -289,6 +289,47 @@ pub fn all_digits(b: &[u8]) -> bool {
     b.iter().all(|c| c.is_ascii_digit())
 }
 
+/// True when all 8 bytes of `w` are ASCII digits.
+#[inline(always)]
+fn is8digits(w: u64) -> bool {
+    (w & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && (w.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+}
+
+/// Value of 8 ASCII digits loaded little-endian (first character most significant).
+#[inline(always)]
+fn digits8(w: u64) -> u64 {
+    let v = (w & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
+    let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
+}
+
+/// F3: digits only (leading zeros allowed). Up to 16 digits with SWAR; longer
+/// strings fall back to the checked loop (too long for i64 -> None, which, like
+/// an out-of-window value, drops the row).
+#[inline(always)]
+pub fn parse_f3(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n == 0 {
+        return None;
+    }
+    if n <= 16 {
+        let mut buf = [b'0'; 16];
+        buf[16 - n..].copy_from_slice(b);
+        let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if !(is8digits(w0) & is8digits(w1)) {
+            return None;
+        }
+        return Some((digits8(w0) * 100_000_000 + digits8(w1)) as i64);
+    }
+    if all_digits(b) {
+        parse_digits_i64(b)
+    } else {
+        None
+    }
+}
+
 /// Parse an F1, F2 or F3 timestamp to epoch ms. None for a bad one (window checked by caller).
 #[inline(always)]
 pub fn parse_ts(b: &[u8]) -> Option<i64> {
@@ -308,11 +349,7 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
             Some(if b[19] == b'+' { base - off } else { base + off })
         }
         _ => {
-            if all_digits(b) {
-                parse_digits_i64(b)
-            } else {
-                None
-            }
+            parse_f3(b)
         }
     }
 }
@@ -557,5 +594,27 @@ pub fn old_parse_dt(b: &[u8]) -> Option<i64> {
         } }
         assert!(n > 100_000);
         eprintln!("valid {n}");
+    }
+}
+
+#[cfg(test)]
+mod f3_tests {
+    use super::*;
+    fn reference(b: &[u8]) -> Option<i64> {
+        if all_digits(b) { parse_digits_i64(b) } else { None }
+    }
+    #[test]
+    fn f3_matches_reference() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        let alphabet = b"0123456789012345678901234567890123456789.-e+ Z\xd9";
+        for _ in 0..2_000_000 {
+            let n = (next() % 22) as usize;
+            let s: Vec<u8> = (0..n).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            assert_eq!(parse_f3(&s), reference(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        for s in ["1791071890000", "0001791071890000", "9999999999999999", "0", "86400000", "00000000000000000001791071890000"] {
+            assert_eq!(parse_f3(s.as_bytes()), reference(s.as_bytes()), "{s}");
+        }
     }
 }
