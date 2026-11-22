@@ -557,6 +557,70 @@ struct Ck {
     camp: u16,
 }
 
+
+/// Eight click records: three full cache lines, written with non-temporal stores.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct CkBlock([Ck; 8]);
+const _: () = assert!(std::mem::size_of::<CkBlock>() == 192);
+const CK_PAD: Ck = Ck { k: 0, cid: NRef::NONE, phi: 0, camp: u16::MAX };
+
+/// Per-thread click records by person partition, staged so every store to
+/// memory is a full cache line.
+struct CkAcc {
+    out: Vec<Vec<CkBlock>>,
+    st: Vec<CkBlock>,
+    n: Vec<u8>,
+}
+
+impl CkAcc {
+    fn new(cap: usize) -> CkAcc {
+        CkAcc { out: (0..PP).map(|_| Vec::with_capacity(cap)).collect(), st: vec![CkBlock([CK_PAD; 8]); PP], n: vec![0; PP] }
+    }
+    #[inline(always)]
+    fn push(&mut self, dst: usize, e: Ck) {
+        let n = self.n[dst] as usize;
+        self.st[dst].0[n] = e;
+        if n < 7 {
+            self.n[dst] = (n + 1) as u8;
+            return;
+        }
+        self.n[dst] = 0;
+        let v = &mut self.out[dst];
+        if v.len() == v.capacity() {
+            v.reserve(v.capacity().max(16));
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        unsafe {
+            use std::arch::x86_64::*;
+            let d = v.as_mut_ptr().add(v.len()) as *mut __m256i;
+            let s = &self.st[dst] as *const CkBlock as *const __m256i;
+            for q in 0..6 {
+                _mm256_stream_si256(d.add(q), _mm256_load_si256(s.add(q)));
+            }
+            v.set_len(v.len() + 1);
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        v.push(self.st[dst]);
+    }
+    fn finish(&mut self) {
+        for dst in 0..PP {
+            let n = self.n[dst] as usize;
+            if n > 0 {
+                let mut blk = self.st[dst];
+                for e in &mut blk.0[n..] {
+                    *e = CK_PAD;
+                }
+                self.out[dst].push(blk);
+                self.n[dst] = 0;
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
+    }
+}
 #[derive(Clone, Copy)]
 struct CkRaw {
     uh: u64,
@@ -864,7 +928,7 @@ fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u32> {
     kills
 }
 
-fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+fn parse_click_chunk(out: &mut CkAcc, c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
     if is_identity(&c.map, 4) {
         parse_click_chunk_impl::<true>(out, c, w, camps, links)
     } else {
@@ -872,17 +936,17 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
     }
 }
 
-fn parse_click_chunk_impl<const IDENT: bool>(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+fn parse_click_chunk_impl<const IDENT: bool>(out: &mut CkAcc, c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
     let end = c.data.as_ptr_range().end;
     const B: usize = 16;
     let lo = w.ws - WEEK;
     let mut batch: [Option<CkRaw>; B] = [None; B];
     let mut nb = 0usize;
-    let flush = |out: &mut [Vec<Ck>], batch: &mut [Option<CkRaw>; B], nb: usize| {
+    let flush = |out: &mut CkAcc, batch: &mut [Option<CkRaw>; B], nb: usize| {
         for slot in batch.iter_mut().take(nb) {
             let c = slot.take().unwrap();
             let (_, ph) = links.person(c.user, c.uh, NRef::NONE);
-            out[upart(ph)].push(Ck { k: key(ph, c.ts - lo), cid: NRef::of(c.cid), phi: (ph >> 32) as u32, camp: c.camp });
+            out.push(upart(ph), Ck { k: key(ph, c.ts - lo), cid: NRef::of(c.cid), phi: (ph >> 32) as u32, camp: c.camp });
         }
     };
     scan::<4>(c.data, |raw| {
@@ -1134,11 +1198,16 @@ fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
 
 /// Concatenate the per-job clicks, sorted by key and then click_id descending
 /// (so the last click at or before a session start is the winner).
-fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
+fn sorted_clicks(parts: Vec<Vec<CkBlock>>) -> Vec<Ck> {
+    // block padding (camp u16::MAX) is skipped
     let mut cnt = vec![0u32; NRBC];
     for p in &parts {
-        for c in p {
-            cnt[rbucket_c(c.k)] += 1;
+        for blk in p {
+            for c in &blk.0 {
+                if c.camp != u16::MAX {
+                    cnt[rbucket_c(c.k)] += 1;
+                }
+            }
         }
     }
     let n = starts_from_counts(&mut cnt);
@@ -1146,11 +1215,15 @@ fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
     let mut out: Vec<Ck> = Vec::with_capacity(n);
     let dst = out.as_mut_ptr();
     for p in &parts {
-        for &c in p {
-            let b = rbucket_c(c.k);
-            // SAFETY: as in sorted_events
-            unsafe { dst.add(cnt[b] as usize).write(c) };
-            cnt[b] += 1;
+        for blk in p {
+            for &c in &blk.0 {
+                if c.camp != u16::MAX {
+                    let b = rbucket_c(c.k);
+                    // SAFETY: as in sorted_events
+                    unsafe { dst.add(cnt[b] as usize).write(c) };
+                    cnt[b] += 1;
+                }
+            }
         }
     }
     drop(parts);
@@ -1409,6 +1482,7 @@ fn main() {
     let base = w.ws - WEEK;
     assert!(w.we - base < (1i64 << TS_BITS), "window too long for 31-bit relative times");
     assert!(prods.cats.len() <= 256, "more categories than an 8-bit category field holds");
+    assert!(camps.channel.len() < u16::MAX as usize, "campaign index u16::MAX is reserved for padding");
     let lay = LocLayout::new(nthreads);
     // expected blocks per thread per partition / bucket, with headroom
     let est_events = ev_bytes / 70;
@@ -1421,7 +1495,7 @@ fn main() {
     log(&format!("links: {nlink} ids"));
 
     // Phase 2: events and clicks in one parallel pass; both resolve persons.
-    let (mut ev_accs, ck_jobs) = rayon::join(
+    let (mut ev_accs, ck_accs) = rayon::join(
         || {
             let r = per_thread_t(&ev_chunks, nthreads, |t| EvAcc::new(t, lay, sv_cap, dk_cap), |acc, c| {
                 parse_event_chunk(acc, c, &w, &prods, &links, base)
@@ -1430,12 +1504,15 @@ fn main() {
             r
         },
         || {
-            per_thread(&ck_chunks, nthreads, || (0..PP).map(|_| Vec::with_capacity(ck_cap)).collect::<Vec<Vec<Ck>>>(), |out, c| {
+            per_thread(&ck_chunks, nthreads, || CkAcc::new(ck_cap / 8 + 2), |out, c| {
                 parse_click_chunk(out, c, &w, &camps, &links)
             })
         },
     );
     ev_accs.par_iter_mut().for_each(|a| a.finish(&links, base));
+    let mut ck_accs = ck_accs;
+    ck_accs.par_iter_mut().for_each(|a| a.finish());
+    let ck_jobs: Vec<Vec<Vec<CkBlock>>> = ck_accs.into_iter().map(|a| a.out).collect();
     log(&format!("parsed events + clicks: {} chunks", ev_chunks.len()));
 
     // Phase 3: dedup over the keys; kills grouped by partition.
@@ -1473,9 +1550,9 @@ fn main() {
     let accs: Vec<Acc> = per_thread_owned(
         ev_by_pp.into_iter().zip(ck_by_pp).zip(kills_pp).collect(),
         nthreads,
-        |((ev, ck), _): &((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len()).sum::<usize>(),
+        |((ev, ck), _): &((Vec<Vec<SvBlock>>, Vec<Vec<CkBlock>>), Vec<u32>)| ev.iter().map(|v| v.len() * 8).sum::<usize>() + ck.iter().map(|v| v.len() * 8).sum::<usize>(),
         || Acc::new(&cx),
-        |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvBlock>>, Vec<Vec<Ck>>), Vec<u32>)| {
+        |acc, ((mut ev_parts, ck_parts), kills): ((Vec<Vec<SvBlock>>, Vec<Vec<CkBlock>>), Vec<u32>)| {
             for k in kills {
                 let (t, _, idx) = lay.unpack(k);
                 ev_parts[tpos[t]][idx / 8].0[idx % 8].pc = PC_DEAD;
