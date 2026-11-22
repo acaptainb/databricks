@@ -763,7 +763,7 @@ fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, link
 
 fn parse_event_chunk_impl<const IDENT: bool>(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
     let end = c.data.as_ptr_range().end;
-    scan::<7>(c.data, |raw| {
+    scan_lines7(c.data, |raw| {
         let [eid, user, ts, ingest, et, prod, price] = if IDENT { raw } else { permute(raw, &c.map) };
         if eid.is_empty() {
             return;

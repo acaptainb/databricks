@@ -753,3 +753,169 @@ mod date_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- whole-line splitter (7 fields)
+
+/// Quote-rule faults for a window whose bit 0 starts a field. S: separators
+/// (comma or newline), Q: quotes. A field is either free of quotes or is
+/// `"..."` (two bytes or more) with no quote inside. One set bit at or before
+/// the separator that ends any field breaking the rule.
+///  - `t & !S`: a quote not at a field start that is not directly before a separator
+///  - `u & S`:  a field that is a lone `"`
+///  - `(sum ^ (t | u)) & S`: a field whose opening and closing quotes do not pair up;
+///    adding the opening quotes to !S carries each one up to its field's separator.
+#[inline(always)]
+fn quote_faults(s: u64, q: u64) -> u64 {
+    let first = (s << 1) | 1;
+    let open = q & first;
+    let other = q & !first;
+    let u = open << 1;
+    let t = other << 1;
+    let sum = (!s).wrapping_add(open);
+    (t & !s) | (u & s) | ((sum ^ (t | u)) & s)
+}
+
+/// Like `scan::<7>`, for event lines. A line whose first three fields end
+/// within 64 bytes of its start, and whose other four and newline end within
+/// 64 bytes of the fourth field's start, is split from the comma, newline and
+/// quote bits of those two windows. Any other line goes through `split`, and
+/// the last bytes of the buffer through `scan`, so the result is the same.
+#[inline(always)]
+pub fn scan_lines7(data: S, mut cb: impl FnMut([S; 7])) {
+    let len = data.len();
+    let base = data.as_ptr();
+    let mut p = 0usize;
+    while p < len {
+        if p + 128 > len {
+            scan::<7>(&data[p..], cb);
+            return;
+        }
+        // SAFETY: p + 128 <= len, and the second window starts at most 64 bytes after p
+        let (ca, na, qa) = unsafe { masks64(base.add(p)) };
+        let c1 = ca.trailing_zeros();
+        let ca1 = ca & ca.wrapping_sub(1);
+        let c2 = ca1.trailing_zeros();
+        let ca2 = ca1 & ca1.wrapping_sub(1);
+        let c3 = ca2.trailing_zeros();
+        let ok_a = c3 < 64 && (na & ((1u64 << c3) - 1)) == 0;
+        if ok_a {
+            let qo = p + c3 as usize + 1;
+            let (cb_, nb, qb) = unsafe { masks64(base.add(qo)) };
+            let e = nb.trailing_zeros();
+            let c4 = cb_.trailing_zeros();
+            let cb1 = cb_ & cb_.wrapping_sub(1);
+            let c5 = cb1.trailing_zeros();
+            let cb2 = cb1 & cb1.wrapping_sub(1);
+            let c6 = cb2.trailing_zeros();
+            let cb3 = cb2 & cb2.wrapping_sub(1);
+            let c7 = cb3.trailing_zeros();
+            // exactly three commas before the newline, all inside the window
+            if e < 64 && c6 < e && c7 > e {
+                let ma = !0u64 >> (63 - c3);
+                let mb = !0u64 >> (63 - e);
+                let (qa, qb) = (qa & ma, qb & mb);
+                let bad = if (qa | qb) == 0 {
+                    0
+                } else {
+                    (quote_faults((ca | na) & ma, qa) & ma) | (quote_faults((cb_ | nb) & mb, qb) & mb)
+                };
+                if bad == 0 {
+                    let o0 = (qa & 1) as usize;
+                    let o1 = ((qa >> (c1 + 1)) & 1) as usize;
+                    let o2 = ((qa >> (c2 + 1)) & 1) as usize;
+                    let o3 = (qb & 1) as usize;
+                    let o4 = ((qb >> (c4 + 1)) & 1) as usize;
+                    let o5 = ((qb >> (c5 + 1)) & 1) as usize;
+                    let o6 = ((qb >> (c6 + 1)) & 1) as usize;
+                    let (c1, c2, c3) = (c1 as usize, c2 as usize, c3 as usize);
+                    let (c4, c5, c6, e) = (c4 as usize, c5 as usize, c6 as usize, e as usize);
+                    // SAFETY: every bound is inside [p, qo + e) which is inside data
+                    let f = unsafe {
+                        [
+                            data.get_unchecked(p + o0..p + c1 - o0),
+                            data.get_unchecked(p + c1 + 1 + o1..p + c2 - o1),
+                            data.get_unchecked(p + c2 + 1 + o2..p + c3 - o2),
+                            data.get_unchecked(qo + o3..qo + c4 - o3),
+                            data.get_unchecked(qo + c4 + 1 + o4..qo + c5 - o4),
+                            data.get_unchecked(qo + c5 + 1 + o5..qo + c6 - o5),
+                            data.get_unchecked(qo + c6 + 1 + o6..qo + e - o6),
+                        ]
+                    };
+                    cb(f);
+                    p = qo + e + 1;
+                    continue;
+                }
+            }
+        }
+        // any other line: exact byte-wise split
+        let nl = match memchr::memchr(b'\n', &data[p..]) {
+            Some(i) => p + i,
+            None => len,
+        };
+        if let Some(f) = split::<7>(&data[p..nl]) {
+            cb(f);
+        }
+        p = nl + 1;
+    }
+}
+
+#[cfg(test)]
+mod lines7_tests {
+    use super::*;
+    fn reference(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let s: S = Box::leak(data.to_vec().into_boxed_slice());
+        scan::<7>(s, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        out
+    }
+    fn fast(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let s: S = Box::leak(data.to_vec().into_boxed_slice());
+        scan_lines7(s, |f| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        out
+    }
+    #[test]
+    fn matches_scan() {
+        let mut x: u64 = 0x0123_4567_89AB_CDEF;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let pieces: &[&[u8]] = &[
+            b"e1", b"u_0123456789abcdef0123456789abcdef", b"2026-10-03T10:00:00Z", b"1791071890000", b"view", b"purchase",
+            b"p1", b"1000", b"", b"\"x\"", b"\"\"", b"\"", b"a\"b", b"\"ab", b"ab\"", b"\r", b"zz", b"\"u_0123456789abcdef0123456789abcdef\"",
+        ];
+        for round in 0..20_000 {
+            let mut data = Vec::new();
+            let lines = 1 + (next() % 12) as usize;
+            for _ in 0..lines {
+                let nf = match next() % 10 {
+                    0 => (next() % 10) as usize,
+                    _ => 7,
+                };
+                for k in 0..nf {
+                    if k > 0 {
+                        data.push(b',');
+                    }
+                    let pc = pieces[(next() % pieces.len() as u64) as usize];
+                    data.extend_from_slice(pc);
+                    if next() % 7 == 0 {
+                        data.push(b'"');
+                    }
+                }
+                data.push(b'\n');
+            }
+            if round % 3 == 0 {
+                data.pop(); // no final newline
+            }
+            // pad so the fast path runs on most lines
+            let mut padded = data.clone();
+            for _ in 0..(next() % 300) {
+                padded.extend_from_slice(b"e9,u9,1791071890000,2026-10-03T10:00:00Z,view,p1,\n");
+            }
+            assert_eq!(fast(&padded), reference(&padded), "{:?}", String::from_utf8_lossy(&padded));
+        }
+    }
+}
