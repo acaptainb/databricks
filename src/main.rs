@@ -42,7 +42,7 @@ pub const CHUNK: usize = 4 << 20;
 
 static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SES_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static SES_NS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// Timestamped stage note on stderr when SS_VERBOSE is set.
 fn vlog(m: &str) {
@@ -1097,6 +1097,7 @@ fn sort_big_sv(v: &mut [Sv]) {
 }
 /// Concatenate the per-job event pairs, sorted by key.
 fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
+    let t_start = Instant::now();
     // records marked PC_DEAD (killed by dedup) or PC_PAD (padding) are skipped
     let mut cnt = vec![0u32; NRB];
     for p in &parts {
@@ -1108,6 +1109,7 @@ fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
             }
         }
     }
+    let tc = Instant::now();
     let n = starts_from_counts(&mut cnt);
     let starts = cnt.clone();
     let mut out: Vec<Sv> = Vec::with_capacity(n);
@@ -1124,12 +1126,17 @@ fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
             }
         }
     }
+    let ts = Instant::now();
     drop(parts);
     unsafe { out.set_len(n) };
     for b in 0..NRB {
         let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
         small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, sort_big_sv);
     }
+    let te = Instant::now();
+    SES_NS[5].fetch_add((tc - t_start).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    SES_NS[6].fetch_add((ts - tc).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    SES_NS[7].fetch_add((te - ts).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     out
 }
 
@@ -1499,7 +1506,7 @@ fn main() {
         },
     );
     log("sessions");
-    vlog(&format!("sessions cpu ms: kills {} sort-events {} sort-clicks {} attribute {} free {}", SES_NS[0].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[1].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[2].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[3].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[4].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000));
+    vlog(&format!("sessions cpu ms: kills {} sort-events {} sort-clicks {} attribute {} free {} [sort-events: count {} scatter {} small-sorts {}]", SES_NS[0].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[1].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[2].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[3].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[4].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[5].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[6].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000, SES_NS[7].load(std::sync::atomic::Ordering::Relaxed) / 1_000_000));
 
     // Phase 4: output.
     let mut camp = vec![0u64; (cx.ncamp + 1) * ndays * 4];
