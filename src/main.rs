@@ -1045,13 +1045,69 @@ fn starts_from_counts(cnt: &mut [u32]) -> usize {
     s as usize
 }
 
-/// Sort a bucket of more than a few records by key in linear time when they
-/// all belong to one person (the same key bits above the time): spread them
-/// over about n time slots by the high bits of (ts - min ts), then
-/// insertion-sort each slot (events cluster into sessions, so slots stay
-/// small). A bucket holding several persons, or a huge one, uses `sort_big_sv`.
-fn sort_mid_sv(v: &mut [Sv]) {
+
+/// Insertion sort by key (for the few records of one time slot or bucket).
+#[inline(always)]
+fn insertion_by_k(w: &mut [Sv]) {
+    for i in 1..w.len() {
+        let x = w[i];
+        let mut j = i;
+        while j > 0 && x.k < w[j - 1].k {
+            w[j] = w[j - 1];
+            j -= 1;
+        }
+        w[j] = x;
+    }
+}
+
+/// Spread one person's records (all keys within [mn, mn + range]) over
+/// time slots by the high bits of (k - mn), then insertion-sort each slot.
+/// `tmp` holds at least v.len() records and `cnt` at least nb + 1 counters.
+#[inline(always)]
+fn slot_sort(v: &mut [Sv], mn: u64, range: u64, tmp: &mut [std::mem::MaybeUninit<Sv>], cnt: &mut [u32]) {
     let n = v.len();
+    let nb_bits = usize::BITS - (n - 1).leading_zeros(); // 2^nb_bits >= n
+    let shift = (64 - range.leading_zeros()).saturating_sub(nb_bits);
+    let nb = ((range >> shift) as usize) + 1;
+    let cnt = &mut cnt[..nb + 1];
+    cnt.fill(0);
+    for e in v.iter() {
+        cnt[((e.k - mn) >> shift) as usize + 1] += 1;
+    }
+    for i in 0..nb {
+        cnt[i + 1] += cnt[i];
+    }
+    for &e in v.iter() {
+        let b = ((e.k - mn) >> shift) as usize;
+        tmp[cnt[b] as usize].write(e);
+        cnt[b] += 1;
+    }
+    // cnt[b] is now the end of slot b; slot b starts at cnt[b - 1] (0 for b = 0)
+    for i in 0..n {
+        // SAFETY: each index below n was written exactly once above
+        v[i] = unsafe { tmp[i].assume_init() };
+    }
+    let mut s = 0usize;
+    for b in 0..nb {
+        let e = cnt[b] as usize;
+        if e - s > 1 {
+            insertion_by_k(&mut v[s..e]);
+        }
+        s = e;
+    }
+}
+
+/// Sort a radix bucket by key. Up to 16 records: insertion sort. One person's
+/// records (the same key bits above the time, almost every bucket): time-slot
+/// sort in linear time, scratch on the stack up to 256 records. Several
+/// persons: comparison sort. More than 4096 records: LSD radix sort.
+#[inline(always)]
+fn sort_bucket_sv(v: &mut [Sv]) {
+    let n = v.len();
+    if n <= 16 {
+        insertion_by_k(v);
+        return;
+    }
     if n > 4096 {
         sort_big_sv(v);
         return;
@@ -1065,47 +1121,24 @@ fn sort_mid_sv(v: &mut [Sv]) {
         return;
     }
     if (mn >> TS_BITS) != (mx >> TS_BITS) {
-        // more than one person hash here: comparison sort
         v.sort_unstable_by_key(|x| x.k);
         return;
     }
-    let range = mx - mn; // > 0, below 2^TS_BITS
-    let nb_bits = (usize::BITS - (n - 1).leading_zeros()).max(4); // slots >= n, at least 16
-    let range_bits = 64 - range.leading_zeros();
-    let shift = range_bits.saturating_sub(nb_bits);
-    let nb = ((range >> shift) as usize) + 1; // slots actually reachable
-    let mut cnt = vec![0u32; nb + 1];
-    for e in v.iter() {
-        cnt[((e.k - mn) >> shift) as usize + 1] += 1;
-    }
-    for i in 0..nb {
-        cnt[i + 1] += cnt[i];
-    }
-    let mut tmp: Vec<Sv> = Vec::with_capacity(n);
-    let dst = tmp.as_mut_ptr();
-    let mut pos = cnt.clone();
-    for &e in v.iter() {
-        let b = ((e.k - mn) >> shift) as usize;
-        // SAFETY: the counts sized every slot; each index below n is written once
-        unsafe { dst.add(pos[b] as usize).write(e) };
-        pos[b] += 1;
-    }
-    unsafe { tmp.set_len(n) };
-    v.copy_from_slice(&tmp);
-    for b in 0..nb {
-        let (s, e) = (cnt[b] as usize, cnt[b + 1] as usize);
-        if e - s > 1 {
-            let w = &mut v[s..e];
-            for i in 1..w.len() {
-                let x = w[i];
-                let mut j = i;
-                while j > 0 && x.k < w[j - 1].k {
-                    w[j] = w[j - 1];
-                    j -= 1;
-                }
-                w[j] = x;
-            }
-        }
+    let range = mx - mn;
+    if n <= 64 {
+        let mut tmp: [std::mem::MaybeUninit<Sv>; 64] = [const { std::mem::MaybeUninit::uninit() }; 64];
+        let mut cnt = [0u32; 66];
+        slot_sort(v, mn, range, &mut tmp, &mut cnt);
+    } else if n <= 256 {
+        let mut tmp: [std::mem::MaybeUninit<Sv>; 256] = [const { std::mem::MaybeUninit::uninit() }; 256];
+        let mut cnt = [0u32; 258];
+        slot_sort(v, mn, range, &mut tmp, &mut cnt);
+    } else {
+        let mut tmp: Vec<std::mem::MaybeUninit<Sv>> = Vec::with_capacity(n);
+        // SAFETY: MaybeUninit needs no initialization
+        unsafe { tmp.set_len(n) };
+        let mut cnt = vec![0u32; n.next_power_of_two() + 2];
+        slot_sort(v, mn, range, &mut tmp, &mut cnt);
     }
 }
 
@@ -1191,7 +1224,7 @@ fn sorted_events(parts: Vec<Vec<SvBlock>>) -> Vec<Sv> {
     unsafe { out.set_len(n) };
     for b in 0..NRB {
         let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
-        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, sort_mid_sv);
+        sort_bucket_sv(&mut out[starts[b] as usize..e]);
     }
     out
 }
