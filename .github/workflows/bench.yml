@@ -127,10 +127,10 @@ jobs:
           done
           cd cur && docker build -q -t shopping-sessions:latest . >/dev/null && cd ..
           for i in 1 2 3; do
-            echo "=== docker run on fixture A1 (start-up cost)"; rm -rf out-d
+            echo "=== docker run on fixture A1 (start-up cost)"; sudo rm -rf out-d
             /usr/bin/time -f "  wall %e s" env CPUS=4 MEM=14g cur/scripts/docker_run.sh cur/fixtures/A1/input out-d
           done
           for i in 1 2; do
-            echo "=== docker run on 20M"; rm -rf out-d
+            echo "=== docker run on 20M"; sudo rm -rf out-d
             /usr/bin/time -f "  wall %e s" env CPUS=4 MEM=14g cur/scripts/docker_run.sh data out-d
           done
