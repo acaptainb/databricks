@@ -52,7 +52,7 @@ jobs:
         id: gen
         uses: actions/cache@v4
         with:
-          path: assets/generator/target/release/generate
+          path: assets/generator/target/x86_64-unknown-linux-gnu/release/generate
           key: generator-${{ hashFiles('assets/generator/src/**', 'assets/generator/Cargo.lock') }}
 
       - name: Build generator
@@ -73,7 +73,7 @@ jobs:
         run: python3 scripts/run_fixtures.py fixtures -- env CPUS=4 MEM=14g PLATFORM=linux/amd64 scripts/docker_run.sh
 
       - name: Generate dev set
-        run: assets/generator/target/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
+        run: assets/generator/target/x86_64-unknown-linux-gnu/release/generate --seed 1 --events 1000000 --clicks 250000 --output dev
 
       - name: Run on dev set
         run: |
