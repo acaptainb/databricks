@@ -30,6 +30,9 @@ on:
       pgo:
         description: Build the candidate with profile-guided optimization (trained on a 2M-event set)
         default: "false"
+      docker_ab:
+        description: Build the candidate and reference Docker images and time both on the dataset (scorer flags)
+        default: "false"
       perf:
         description: Also record a perf profile of the candidate
         default: "false"
@@ -174,3 +177,18 @@ jobs:
             DATA_DIR=data OUTPUT_DIR=out-c NCPU=$(nproc) /usr/bin/time -f "  wall %e s  user %U  sys %S  maxrss %M KB" ./cand
           done
           python3 cur/scripts/compare.py out-o out-c || true
+
+      - name: Docker A/B (scorer flags, whole container)
+        if: ${{ inputs.docker_ab == 'true' }}
+        run: |
+          (cd cur && docker build -q -t ss:cand . >/dev/null)
+          (cd base && docker build -q -t ss:ref . >/dev/null)
+          for i in 1 2 3; do
+            for img in ref cand; do
+              sudo rm -rf out-d
+              s=$(date +%s.%N)
+              IMAGE=ss:$img CPUS=4 MEM=14g cur/scripts/docker_run.sh data out-d
+              e=$(date +%s.%N)
+              echo "=== docker $img run $i: $(echo "$e - $s" | bc) s"
+            done
+          done
