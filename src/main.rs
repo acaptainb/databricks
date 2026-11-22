@@ -52,29 +52,33 @@ fn upart(h: u64) -> usize {
 
 // ---------------------------------------------------------------- small lookup tables
 
+/// String -> index map keyed by Small (no memcmp on lookup).
 struct StrMap {
     table: HashTable<u32>,
     keys: Vec<S>,
+    sk: Vec<Small>,
 }
 
 impl StrMap {
     fn new() -> Self {
-        StrMap { table: HashTable::new(), keys: Vec::new() }
+        StrMap { table: HashTable::new(), keys: Vec::new(), sk: Vec::new() }
     }
     #[inline(always)]
-    fn get(&self, k: &[u8], h: u64) -> Option<u32> {
-        self.table.find(h, |&i| self.keys[i as usize] == k).copied()
+    fn get(&self, k: Small) -> Option<u32> {
+        self.table.find(k.h(), |&i| self.sk[i as usize] == k).copied()
     }
     fn intern(&mut self, k: S) -> u32 {
-        let h = hb(k);
-        let keys = &self.keys;
-        if let Some(&i) = self.table.find(h, |&i| keys[i as usize] == k) {
+        let s = Small::new(k);
+        let h = s.h();
+        let sk = &self.sk;
+        if let Some(&i) = self.table.find(h, |&i| sk[i as usize] == s) {
             return i;
         }
         let i = self.keys.len() as u32;
         self.keys.push(k);
-        let keys = &self.keys;
-        self.table.insert_unique(h, i, |&j| hb(keys[j as usize]));
+        self.sk.push(s);
+        let sk = &self.sk;
+        self.table.insert_unique(h, i, |&j| sk[j as usize].h());
         i
     }
 }
@@ -190,7 +194,8 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
             scan::<2>(c.data, |raw| {
                 let [a, b] = permute(raw, &c.map);
                 if !a.is_empty() && !b.is_empty() {
-                    let (sa, sb) = (Small::new(a), Small::new(b));
+                    let end = c.data.as_ptr_range().end;
+                    let (sa, sb) = (Small::new_in(a, end), Small::new_in(b, end));
                     let ha = sa.h();
                     let hb_ = sb.h();
                     v[upart(ha)].push((sa, ha, n * 2));
@@ -450,13 +455,33 @@ struct Win {
 
 // ---------------------------------------------------------------- events
 
+/// 1 view, 2 cart, 3 purchase, 0 anything else (exact, case-sensitive).
+#[inline(always)]
+fn event_kind(et: &[u8]) -> u8 {
+    match et.len() {
+        4 => {
+            let w = u32::from_le_bytes(et.try_into().unwrap());
+            if w == u32::from_le_bytes(*b"view") {
+                1
+            } else if w == u32::from_le_bytes(*b"cart") {
+                2
+            } else {
+                0
+            }
+        }
+        8 => (u64::from_le_bytes(et.try_into().unwrap()) == u64::from_le_bytes(*b"purchase")) as u8 * 3,
+        _ => 0,
+    }
+}
+
 fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) {
+    let end = c.data.as_ptr_range().end;
     scan::<7>(c.data, |raw| {
         let [eid, user, ts, ingest, et, prod, price] = permute(raw, &c.map);
         if eid.is_empty() {
             return;
         }
-        let se = Small::new(eid);
+        let se = Small::new_in(eid, end);
         let h = se.h();
         let ingest_ms = parse_ts(ingest);
         let mut kind = 0u8;
@@ -466,16 +491,11 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
         let mut usr = Small::new(b"");
         if let (Some(ing), Some(t)) = (ingest_ms, parse_ts(ts)) {
             if !user.is_empty() && t >= w.ws && t < w.we && !prod.is_empty() && ing - t <= LATE {
-                let k = match et {
-                    b"view" => 1,
-                    b"cart" => 2,
-                    b"purchase" => 3,
-                    _ => 0,
-                };
+                let k = event_kind(et);
                 if k == 3 {
                     if let Some(p) = parse_price(price) {
                         pr = p;
-                        cat = match prods.map.get(prod, hb(prod)) {
+                        cat = match prods.map.get(Small::new(prod)) {
                             Some(i) => prods.cat_of[i as usize],
                             None => prods.unknown,
                         };
@@ -486,7 +506,7 @@ fn parse_event_chunk(out: &mut [Vec<Ev>], c: &Chunk, w: &Win, prods: &Products) 
                 }
                 if kind != 0 {
                     tsv = t;
-                    usr = Small::new(user);
+                    usr = Small::new_in(user, end);
                 }
             }
         }
@@ -586,6 +606,7 @@ fn dedup_bucket(mut parts: Vec<Vec<Ev>>, links: &LinkTable, base: i64) -> Vec<Ve
 }
 
 fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+    let end = c.data.as_ptr_range().end;
     const B: usize = 16;
     let lo = w.ws - WEEK;
     let mut batch: [Option<CkRaw>; B] = [None; B];
@@ -606,8 +627,8 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
         if t < lo || t >= w.we {
             return;
         }
-        let Some(ci) = camps.map.get(camp, hb(camp)) else { return };
-        let su = Small::new(user);
+        let Some(ci) = camps.map.get(Small::new_in(camp, end)) else { return };
+        let su = Small::new_in(user, end);
         let uh = su.h();
         links.prefetch(uh);
         batch[nb] = Some(CkRaw { uh, ts: t, user: su, cid, camp: ci as u16 });
@@ -719,19 +740,11 @@ fn rbucket(k: u64) -> usize {
     (k >> (64 - RB)) as usize
 }
 
-/// Insertion sort for the short runs, a library sort for longer ones.
+/// Insertion sort for the short runs, `big` (a library sort) for longer ones.
 #[inline(always)]
-fn small_sort<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool) {
+fn small_sort<T: Copy>(v: &mut [T], less: impl Fn(&T, &T) -> bool, big: impl Fn(&mut [T])) {
     if v.len() > 48 {
-        v.sort_unstable_by(|a, b| {
-            if less(a, b) {
-                std::cmp::Ordering::Less
-            } else if less(b, a) {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
+        big(v);
         return;
     }
     for i in 1..v.len() {
@@ -789,7 +802,7 @@ fn sorted_events(parts: Vec<Vec<SvPair>>) -> Vec<Sv> {
     unsafe { out.set_len(n) };
     for b in 0..NRB {
         let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
-        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k);
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k, |s| s.sort_unstable_by_key(|x| x.k));
     }
     out
 }
@@ -819,7 +832,9 @@ fn sorted_clicks(parts: Vec<Vec<Ck>>) -> Vec<Ck> {
     unsafe { out.set_len(n) };
     for b in 0..NRB {
         let e = if b + 1 < NRB { starts[b + 1] as usize } else { n };
-        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k || (x.k == y.k && x.cid > y.cid));
+        small_sort(&mut out[starts[b] as usize..e], |x, y| x.k < y.k || (x.k == y.k && x.cid > y.cid), |s| {
+            s.sort_unstable_by(|x, y| x.k.cmp(&y.k).then_with(|| y.cid.cmp(x.cid)))
+        });
     }
     out
 }

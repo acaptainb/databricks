@@ -38,6 +38,20 @@ impl Small {
         }
     }
 
+    /// Like `new`, but a short string is read with one 16-byte load when the 16
+    /// bytes from its start lie before `end` (the end of readable memory).
+    #[inline(always)]
+    pub fn new_in(s: S, end: *const u8) -> Small {
+        let n = s.len();
+        if n <= 15 && (s.as_ptr() as usize) + 16 <= end as usize {
+            // SAFETY: the 16 bytes at s.as_ptr() are inside the mapping (checked above)
+            let raw = unsafe { std::ptr::read_unaligned(s.as_ptr() as *const u128) };
+            let v = (raw & ((1u128 << (8 * n)) - 1)) | ((n as u128) << 120);
+            return Small { b: v.to_le_bytes() };
+        }
+        Small::new(s)
+    }
+
     #[inline(always)]
     fn long(s: S, h: u64) -> Small {
         let len = s.len().min(0x0FFF) as u64;
@@ -150,5 +164,15 @@ mod tests {
         assert_eq!(x.as_bytes(), b"abcdefghijklmno");
         assert_eq!(y.as_bytes(), b"abcdefghijklmnop");
         assert!(x != y);
+        // new_in matches new for every length, inside and at the edge of a buffer
+        let buf = leak("abcdefghijklmnopqrstuvwxyz0123456789,\"x\",tail");
+        let end = buf.as_ptr_range().end;
+        for st in 0..buf.len() {
+            for en in st..=buf.len() {
+                let s = &buf[st..en];
+                let (p, q) = (Small::new(s), Small::new_in(s, end));
+                assert!(p == q && p.h() == q.h() && p.as_bytes() == q.as_bytes() && q.as_bytes() == s);
+            }
+        }
     }
 }
