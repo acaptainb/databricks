@@ -39,6 +39,17 @@ const PP_BITS: u32 = 8; // user / person partitions (bits 40..)
 const PP: usize = 1 << PP_BITS;
 pub const CHUNK: usize = 4 << 20;
 
+
+static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Timestamped stage note on stderr when SS_VERBOSE is set.
+fn vlog(m: &str) {
+    if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        let t = T0.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        eprintln!("    [{t:7.3}s] {m}");
+    }
+}
 #[inline(always)]
 pub fn hb(b: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(b)
@@ -237,6 +248,7 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         pbase[p + 1] = pbase[p] + parts[p].keys.len() as u32;
     }
     let n = pbase[PP] as usize;
+    vlog(&format!("links: parsed + interned {n} ids, {npairs} pairs"));
     let mut parent: Vec<u32> = (0..n as u32).collect();
     for k in 0..npairs {
         let (x, y) = (local[2 * k], local[2 * k + 1]);
@@ -253,11 +265,13 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
         }
     }
     drop(local);
+    vlog("links: union-find done");
     let mut root = vec![0u32; n];
     for i in 0..n {
         root[i] = find(&mut parent, i as u32);
     }
     // name = byte-wise smallest ID of the component
+    vlog("links: roots done");
     let mut name: Vec<Option<Small>> = vec![None; n];
     for (p, part) in parts.iter().enumerate() {
         let b = pbase[p] as usize;
@@ -276,7 +290,10 @@ fn build_links(files: &[S]) -> (LinkTable, usize) {
     });
     drop(root);
     drop(name);
-    (LinkTable::build(&parts, n), n)
+    vlog("links: names done");
+    let t = LinkTable::build(&parts, n);
+    vlog("links: table built");
+    (t, n)
 }
 
 /// Flat open-addressing table of every linked ID -> (person name, name hash).
@@ -1008,6 +1025,8 @@ fn transpose<T>(v: Vec<Vec<Vec<T>>>, nb: usize) -> Vec<Vec<Vec<T>>> {
 
 fn main() {
     let t0 = Instant::now();
+    let _ = T0.set(t0);
+    VERBOSE.store(std::env::var("SS_VERBOSE").is_ok(), std::sync::atomic::Ordering::Relaxed);
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let log = |m: &str| {
         if verbose {
@@ -1049,9 +1068,11 @@ fn main() {
     let ((links, nlink), ev_jobs) = rayon::join(
         || build_links(&ln_files),
         || {
-            per_thread(&ev_chunks, nthreads, || (0..DB).map(|_| Vec::with_capacity(ev_cap)).collect::<Vec<Vec<Ev>>>(), |out, c| {
+            let r = per_thread(&ev_chunks, nthreads, || (0..DB).map(|_| Vec::with_capacity(ev_cap)).collect::<Vec<Vec<Ev>>>(), |out, c| {
                 parse_event_chunk(out, c, &w, &prods)
-            })
+            });
+            vlog("events: all chunks parsed");
+            r
         },
     );
     log(&format!("parsed events: {} chunks, {} link ids", ev_chunks.len(), nlink));
