@@ -775,75 +775,104 @@ fn quote_faults(s: u64, q: u64) -> u64 {
     (t & !s) | (u & s) | ((sum ^ (t | u)) & s)
 }
 
-/// Like `scan::<7>`, for event lines. A line whose first three fields end
-/// within 64 bytes of its start, and whose other four and newline end within
-/// 64 bytes of the fourth field's start, is split from the comma, newline and
-/// quote bits of those two windows. Any other line goes through `split`, and
-/// the last bytes of the buffer through `scan`, so the result is the same.
+/// One window of a line: its separators and quote mask, positions relative to
+/// the window start (which is a field start).
+#[derive(Clone, Copy)]
+struct Win7 {
+    sep: [u32; 4], // the k commas
+    end: u32,      // the k-th comma (inner window) or the newline (last window)
+    q: u64,        // quotes in [0, end]
+}
+
+/// Read the window at `pos` and take `K` commas from it. An inner window
+/// (`FIN` false) must hold K commas and no newline before the K-th; the last
+/// window (`FIN` true) must hold exactly K commas before its newline. The
+/// quote rules are checked for every field in the window.
+#[inline(always)]
+unsafe fn win7<const K: usize, const FIN: bool>(base: *const u8, pos: usize) -> Option<Win7> {
+    let (c, n, q) = masks64(base.add(pos));
+    let mut sep = [0u32; 4];
+    let mut cc = c;
+    for s in sep.iter_mut().take(K) {
+        *s = cc.trailing_zeros();
+        cc &= cc.wrapping_sub(1);
+    }
+    let end = if FIN {
+        let e = n.trailing_zeros();
+        let next = cc.trailing_zeros();
+        if !(e < 64 && (K == 0 || sep[K - 1] < e) && next > e) {
+            return None;
+        }
+        e
+    } else {
+        let ck = sep[K - 1];
+        if ck >= 64 || (n & ((1u64 << ck) - 1)) != 0 {
+            return None;
+        }
+        ck
+    };
+    let m = !0u64 >> (63 - end);
+    let qm = q & m;
+    if qm != 0 && (quote_faults((c | n) & m, qm) & m) != 0 {
+        return None;
+    }
+    Some(Win7 { sep, end, q: qm })
+}
+
+/// The fields of a window starting at `pos`, quotes removed, into out[at..]:
+/// K fields for an inner window, K + 1 (the last ending at the newline) for
+/// the last one.
+#[inline(always)]
+unsafe fn fields7<const K: usize, const FIN: bool>(data: S, pos: usize, w: &Win7, out: &mut [S; 7], at: usize) {
+    let mut start = 0u32;
+    let nf = if FIN { K + 1 } else { K };
+    for i in 0..nf {
+        let end = if i < K { w.sep[i] } else { w.end };
+        let o = ((w.q >> start) & 1) as usize;
+        out[at + i] = data.get_unchecked(pos + start as usize + o..pos + end as usize - o);
+        start = end + 1;
+    }
+}
+
+/// Like `scan::<7>`, for event lines. A line is split from the comma, newline
+/// and quote bits of two windows (fields 3 + 4) or, when its IDs are long,
+/// three (2 + 2 + 3). Any other line goes through `split`, and the last bytes
+/// of the buffer through `scan`, so the result is the same.
 #[inline(always)]
 pub fn scan_lines7(data: S, mut cb: impl FnMut([S; 7])) {
     let len = data.len();
     let base = data.as_ptr();
     let mut p = 0usize;
+    let mut f: [S; 7] = [&[]; 7];
     while p < len {
-        if p + 128 > len {
+        if p + 192 > len {
             scan::<7>(&data[p..], cb);
             return;
         }
-        // SAFETY: p + 128 <= len, and the second window starts at most 64 bytes after p
-        let (ca, na, qa) = unsafe { masks64(base.add(p)) };
-        let c1 = ca.trailing_zeros();
-        let ca1 = ca & ca.wrapping_sub(1);
-        let c2 = ca1.trailing_zeros();
-        let ca2 = ca1 & ca1.wrapping_sub(1);
-        let c3 = ca2.trailing_zeros();
-        let ok_a = c3 < 64 && (na & ((1u64 << c3) - 1)) == 0;
-        if ok_a {
-            let qo = p + c3 as usize + 1;
-            let (cb_, nb, qb) = unsafe { masks64(base.add(qo)) };
-            let e = nb.trailing_zeros();
-            let c4 = cb_.trailing_zeros();
-            let cb1 = cb_ & cb_.wrapping_sub(1);
-            let c5 = cb1.trailing_zeros();
-            let cb2 = cb1 & cb1.wrapping_sub(1);
-            let c6 = cb2.trailing_zeros();
-            let cb3 = cb2 & cb2.wrapping_sub(1);
-            let c7 = cb3.trailing_zeros();
-            // exactly three commas before the newline, all inside the window
-            if e < 64 && c6 < e && c7 > e {
-                let ma = !0u64 >> (63 - c3);
-                let mb = !0u64 >> (63 - e);
-                let (qa, qb) = (qa & ma, qb & mb);
-                let bad = if (qa | qb) == 0 {
-                    0
-                } else {
-                    (quote_faults((ca | na) & ma, qa) & ma) | (quote_faults((cb_ | nb) & mb, qb) & mb)
-                };
-                if bad == 0 {
-                    let o0 = (qa & 1) as usize;
-                    let o1 = ((qa >> (c1 + 1)) & 1) as usize;
-                    let o2 = ((qa >> (c2 + 1)) & 1) as usize;
-                    let o3 = (qb & 1) as usize;
-                    let o4 = ((qb >> (c4 + 1)) & 1) as usize;
-                    let o5 = ((qb >> (c5 + 1)) & 1) as usize;
-                    let o6 = ((qb >> (c6 + 1)) & 1) as usize;
-                    let (c1, c2, c3) = (c1 as usize, c2 as usize, c3 as usize);
-                    let (c4, c5, c6, e) = (c4 as usize, c5 as usize, c6 as usize, e as usize);
-                    // SAFETY: every bound is inside [p, qo + e) which is inside data
-                    let f = unsafe {
-                        [
-                            data.get_unchecked(p + o0..p + c1 - o0),
-                            data.get_unchecked(p + c1 + 1 + o1..p + c2 - o1),
-                            data.get_unchecked(p + c2 + 1 + o2..p + c3 - o2),
-                            data.get_unchecked(qo + o3..qo + c4 - o3),
-                            data.get_unchecked(qo + c4 + 1 + o4..qo + c5 - o4),
-                            data.get_unchecked(qo + c5 + 1 + o5..qo + c6 - o5),
-                            data.get_unchecked(qo + c6 + 1 + o6..qo + e - o6),
-                        ]
-                    };
+        // SAFETY: every window read starts at most 128 bytes after p, and p + 192 <= len
+        unsafe {
+            if let Some(a) = win7::<3, false>(base, p) {
+                let qo = p + a.end as usize + 1;
+                if let Some(b) = win7::<3, true>(base, qo) {
+                    fields7::<3, false>(data, p, &a, &mut f, 0);
+                    fields7::<3, true>(data, qo, &b, &mut f, 3);
                     cb(f);
-                    p = qo + e + 1;
+                    p = qo + b.end as usize + 1;
                     continue;
+                }
+            }
+            if let Some(a) = win7::<2, false>(base, p) {
+                let q1 = p + a.end as usize + 1;
+                if let Some(b) = win7::<2, false>(base, q1) {
+                    let q2 = q1 + b.end as usize + 1;
+                    if let Some(c) = win7::<2, true>(base, q2) {
+                        fields7::<2, false>(data, p, &a, &mut f, 0);
+                        fields7::<2, false>(data, q1, &b, &mut f, 2);
+                        fields7::<2, true>(data, q2, &c, &mut f, 4);
+                        cb(f);
+                        p = q2 + c.end as usize + 1;
+                        continue;
+                    }
                 }
             }
         }
@@ -852,8 +881,8 @@ pub fn scan_lines7(data: S, mut cb: impl FnMut([S; 7])) {
             Some(i) => p + i,
             None => len,
         };
-        if let Some(f) = split::<7>(&data[p..nl]) {
-            cb(f);
+        if let Some(fs) = split::<7>(&data[p..nl]) {
+            cb(fs);
         }
         p = nl + 1;
     }
