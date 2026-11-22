@@ -647,6 +647,7 @@ struct EvAcc {
     st: Vec<DBlock>,
     st_n: Vec<u8>,
     pend: Vec<Pend>,
+    deferred: Vec<Pend>, // valid copies parsed before the link table was ready
 }
 
 impl EvAcc {
@@ -661,6 +662,7 @@ impl EvAcc {
             st: vec![DBlock([DKEY_PAD; 4]); DB],
             st_n: vec![0; DB],
             pend: Vec::with_capacity(PEND_BATCH),
+            deferred: Vec::new(),
         }
     }
 
@@ -709,6 +711,15 @@ impl EvAcc {
     /// Flush every staging buffer; call once after the last chunk.
     fn finish(&mut self, links: &LinkTable, base: i64) {
         self.flush_pend(links, base);
+        // copies parsed before the link table existed: resolve them now, prefetched in batches
+        let deferred = std::mem::take(&mut self.deferred);
+        for chunk in deferred.chunks(PEND_BATCH) {
+            for p in chunk {
+                links.prefetch(p.uh);
+            }
+            self.pend.extend_from_slice(chunk);
+            self.flush_pend(links, base);
+        }
         self.sc.finish(&mut self.sv);
         for b in 0..DB {
             let n = self.st_n[b] as usize;
@@ -728,7 +739,9 @@ impl EvAcc {
     }
 }
 
-fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: &LinkTable, base: i64) {
+/// `links` is None while the link table is still being built: valid copies are
+/// then kept in `acc.deferred` and resolved in `EvAcc::finish`.
+fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, links: Option<&LinkTable>, base: i64) {
     let end = c.data.as_ptr_range().end;
     scan::<7>(c.data, |raw| {
         let [eid, user, ts, ingest, et, prod, price] = permute(raw, &c.map);
@@ -765,10 +778,16 @@ fn parse_event_chunk(acc: &mut EvAcc, c: &Chunk, w: &Win, prods: &Products, link
                 if ok {
                     let usr = Small::new_in(user, end);
                     let uh = usr.h();
-                    links.prefetch(uh);
-                    acc.pend.push(Pend { uh, user: usr, uref: NRef::of(user), ts: t, bucket, hx, ingest: ing, pc });
-                    if acc.pend.len() == PEND_BATCH {
-                        acc.flush_pend(links, base);
+                    let p = Pend { uh, user: usr, uref: NRef::of(user), ts: t, bucket, hx, ingest: ing, pc };
+                    match links {
+                        Some(l) => {
+                            l.prefetch(uh);
+                            acc.pend.push(p);
+                            if acc.pend.len() == PEND_BATCH {
+                                acc.flush_pend(l, base);
+                            }
+                        }
+                        None => acc.deferred.push(p),
                     }
                     return;
                 }
@@ -813,19 +832,41 @@ fn dedup_keys(blocks: Vec<Vec<DBlock>>) -> Vec<u32> {
     kills
 }
 
-fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns, links: &LinkTable) {
+/// Per-thread click accumulator: clicks by person partition, plus valid clicks
+/// parsed before the link table was ready (resolved by `CkAcc::finish`).
+struct CkAcc {
+    out: Vec<Vec<Ck>>,
+    deferred: Vec<CkRaw>,
+}
+
+impl CkAcc {
+    fn new(cap: usize) -> CkAcc {
+        CkAcc { out: (0..PP).map(|_| Vec::with_capacity(cap)).collect(), deferred: Vec::new() }
+    }
+    #[inline(always)]
+    fn emit(&mut self, c: &CkRaw, links: &LinkTable, lo: i64) {
+        let (_, ph) = links.person(c.user, c.uh, NRef::NONE);
+        self.out[upart(ph)].push(Ck { k: key(ph, c.ts - lo), cid: NRef::of(c.cid), phi: (ph >> 32) as u32, camp: c.camp });
+    }
+    fn finish(&mut self, links: &LinkTable, lo: i64) {
+        let deferred = std::mem::take(&mut self.deferred);
+        for chunk in deferred.chunks(16) {
+            for c in chunk {
+                links.prefetch(c.uh);
+            }
+            for c in chunk {
+                self.emit(c, links, lo);
+            }
+        }
+    }
+}
+
+fn parse_click_chunk(acc: &mut CkAcc, c: &Chunk, w: &Win, camps: &Campaigns, links: Option<&LinkTable>) {
     let end = c.data.as_ptr_range().end;
     const B: usize = 16;
     let lo = w.ws - WEEK;
     let mut batch: [Option<CkRaw>; B] = [None; B];
     let mut nb = 0usize;
-    let flush = |out: &mut [Vec<Ck>], batch: &mut [Option<CkRaw>; B], nb: usize| {
-        for slot in batch.iter_mut().take(nb) {
-            let c = slot.take().unwrap();
-            let (_, ph) = links.person(c.user, c.uh, NRef::NONE);
-            out[upart(ph)].push(Ck { k: key(ph, c.ts - lo), cid: NRef::of(c.cid), phi: (ph >> 32) as u32, camp: c.camp });
-        }
-    };
     scan::<4>(c.data, |raw| {
         let [cid, user, camp, ts] = permute(raw, &c.map);
         if cid.is_empty() || user.is_empty() {
@@ -838,15 +879,27 @@ fn parse_click_chunk(out: &mut [Vec<Ck>], c: &Chunk, w: &Win, camps: &Campaigns,
         let Some(ci) = camps.map.get(Small::new_in(camp, end)) else { return };
         let su = Small::new_in(user, end);
         let uh = su.h();
-        links.prefetch(uh);
-        batch[nb] = Some(CkRaw { uh, ts: t, user: su, cid, camp: ci as u16 });
-        nb += 1;
-        if nb == B {
-            flush(out, &mut batch, nb);
-            nb = 0;
+        let r = CkRaw { uh, ts: t, user: su, cid, camp: ci as u16 };
+        match links {
+            Some(l) => {
+                l.prefetch(uh);
+                batch[nb] = Some(r);
+                nb += 1;
+                if nb == B {
+                    for slot in batch.iter_mut() {
+                        acc.emit(&slot.take().unwrap(), l, lo);
+                    }
+                    nb = 0;
+                }
+            }
+            None => acc.deferred.push(r),
         }
     });
-    flush(out, &mut batch, nb);
+    if let Some(l) = links {
+        for slot in batch.iter_mut().take(nb) {
+            acc.emit(&slot.take().unwrap(), l, lo);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- sessions and aggregation
@@ -1345,27 +1398,41 @@ fn main() {
     let dk_cap = est_events / nthreads / DB / 4 + 8;
     let ck_cap = ck_bytes / 40 / nthreads / PP + 32;
 
-    // Phase 1: links, on all threads.
-    let (links, nlink) = build_links(&ln_files);
-    log(&format!("links: {nlink} ids"));
-
-    // Phase 2: events and clicks in one parallel pass; both resolve persons.
-    let (mut ev_accs, ck_jobs) = rayon::join(
+    // Phases 1 + 2 overlapped: links are built while events and clicks are
+    // already being parsed; copies parsed before the link table is ready are
+    // kept and resolved once it is.
+    let links_cell: std::sync::OnceLock<(LinkTable, usize)> = std::sync::OnceLock::new();
+    let ((), (mut ev_accs, mut ck_accs)) = rayon::join(
         || {
-            let r = per_thread_t(&ev_chunks, nthreads, |t| EvAcc::new(t, lay, sv_cap, dk_cap), |acc, c| {
-                parse_event_chunk(acc, c, &w, &prods, &links, base)
-            });
-            vlog("events: all chunks parsed");
-            r
+            let r = build_links(&ln_files);
+            let _ = links_cell.set(r);
+            vlog("links ready");
         },
         || {
-            per_thread(&ck_chunks, nthreads, || (0..PP).map(|_| Vec::with_capacity(ck_cap)).collect::<Vec<Vec<Ck>>>(), |out, c| {
-                parse_click_chunk(out, c, &w, &camps, &links)
-            })
+            rayon::join(
+                || {
+                    let r = per_thread_t(&ev_chunks, nthreads, |t| EvAcc::new(t, lay, sv_cap, dk_cap), |acc, c| {
+                        parse_event_chunk(acc, c, &w, &prods, links_cell.get().map(|x| &x.0), base)
+                    });
+                    vlog("events: all chunks parsed");
+                    r
+                },
+                || {
+                    per_thread(&ck_chunks, nthreads, || CkAcc::new(ck_cap), |acc, c| {
+                        parse_click_chunk(acc, c, &w, &camps, links_cell.get().map(|x| &x.0))
+                    })
+                },
+            )
         },
     );
-    ev_accs.par_iter_mut().for_each(|a| a.finish(&links, base));
-    log(&format!("parsed events + clicks: {} chunks", ev_chunks.len()));
+    let (links, nlink) = links_cell.get().expect("link table");
+    let nlink = *nlink;
+    rayon::join(
+        || ev_accs.par_iter_mut().for_each(|a| a.finish(links, base)),
+        || ck_accs.par_iter_mut().for_each(|a| a.finish(links, w.ws - WEEK)),
+    );
+    let ck_jobs: Vec<Vec<Vec<Ck>>> = ck_accs.into_iter().map(|a| a.out).collect();
+    log(&format!("links: {nlink} ids; parsed events + clicks: {} chunks", ev_chunks.len()));
 
     // Phase 3: dedup over the keys; kills grouped by partition.
     // thread slot -> position in ev_accs
